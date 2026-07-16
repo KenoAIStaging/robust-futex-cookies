@@ -1,0 +1,419 @@
+From 0c221ffebf396da284dfc9ad17488d60e12839e9 Mon Sep 17 00:00:00 2001
+From: Keno Fischer <keno@juliahub.com>
+Date: Thu, 16 Jul 2026 08:22:52 +0000
+Subject: [PATCH 5/6] sched/membarrier: Add
+ MEMBARRIER_CMD_SHARED_EXPEDITED_RSEQ
+
+Cookie based robust futexes with per lock reservation counters require a
+quiescing operation on counter epoch changes: before cookie values from a
+previous epoch can be reused, all lock attempts holding stale
+reservations must be forced to restart. Reservations are only held inside
+RSEQ critical sections (respectively inside the VDSO robust cmpxchg
+window), so an RSEQ fence of every task which can possibly hold a
+reservation for the lock does the job. For PROCESS_SHARED locks these
+tasks can belong to arbitrary processes which share nothing but the
+memory containing the lock, so neither MEMBARRIER_CMD_PRIVATE_* (own mm
+only) nor MEMBARRIER_CMD_GLOBAL_EXPEDITED (no RSEQ semantics) can be
+used.
+
+Add MEMBARRIER_CMD_SHARED_EXPEDITED_RSEQ, which executes an RSEQ fence on
+all running tasks of all processes which have a shared writable mapping
+of the page containing a given user space address. The address is handed
+in through a new fourth system call argument, which is ignored by all
+other commands. Adding an argument follows the precedent of the cpu_id
+argument added in commit 2a36ab717e8f ("rseq/membarrier: Add
+MEMBARRIER_CMD_PRIVATE_EXPEDITED_RSEQ").
+
+Targeting is doubly gated:
+
+ 1) Only processes which declared their intent to participate via the
+    accompanying MEMBARRIER_CMD_REGISTER_SHARED_EXPEDITED_RSEQ
+    registration are eligible, following the opt-in philosophy of the
+    other expedited commands. A process which registers agrees to both
+    issue and receive shared RSEQ fences.
+
+ 2) Only processes which have the page mapped shared and writable are
+    eligible. Processes which mutually grant write access to shared
+    memory already trust each other with much worse than a spurious
+    RSEQ restart. The caller itself must have such a mapping of the
+    page as well, which prevents fencing arbitrary read only mapped
+    files.
+
+The implementation pins the page through the caller's mapping,
+snapshots each online CPU's current mm with the usual expedited
+membarrier ordering, and then walks the rmap of the pinned folio to
+collect the CPUs which currently run tasks of eligible mms. Those get
+the same RSEQ IPI as MEMBARRIER_CMD_PRIVATE_EXPEDITED_RSEQ. Tasks which
+are not running receive their RSEQ event naturally through the scheduler
+before they can resume user space execution.
+
+The mm snapshot is compared by pointer after the RCU section ends, so a
+stale pointer can cause a spurious RSEQ IPI on a CPU which was
+reallocated meanwhile. That is harmless: a fresh task on that CPU went
+through the scheduler, which implies the event and barriers anyway.
+
+The eligibility test reads mm->membarrier_state directly during the rmap
+walk, so unlike the other registrations no runqueue state
+synchronization is required; registration is a simple atomic_or plus the
+barrier which orders it against subsequent memory accesses.
+
+Signed-off-by: Keno Fischer <keno@juliahub.com>
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+---
+ include/linux/sched/mm.h        |   2 +
+ include/linux/syscalls.h        |   3 +-
+ include/uapi/linux/membarrier.h |  34 ++++++
+ kernel/sched/membarrier.c       | 204 +++++++++++++++++++++++++++++++-
+ 4 files changed, 239 insertions(+), 4 deletions(-)
+
+diff --git a/include/linux/sched/mm.h b/include/linux/sched/mm.h
+index 95d0040df584..8741d4d794b0 100644
+--- a/include/linux/sched/mm.h
++++ b/include/linux/sched/mm.h
+@@ -521,6 +521,8 @@ enum {
+ 	MEMBARRIER_STATE_PRIVATE_EXPEDITED_SYNC_CORE		= (1U << 5),
+ 	MEMBARRIER_STATE_PRIVATE_EXPEDITED_RSEQ_READY		= (1U << 6),
+ 	MEMBARRIER_STATE_PRIVATE_EXPEDITED_RSEQ			= (1U << 7),
++	MEMBARRIER_STATE_SHARED_EXPEDITED_RSEQ_READY		= (1U << 8),
++	MEMBARRIER_STATE_SHARED_EXPEDITED_RSEQ			= (1U << 9),
+ };
+ 
+ enum {
+diff --git a/include/linux/syscalls.h b/include/linux/syscalls.h
+index 874d9067a43b..d4bf2ab540c9 100644
+--- a/include/linux/syscalls.h
++++ b/include/linux/syscalls.h
+@@ -946,7 +946,8 @@ asmlinkage long sys_execveat(int dfd, const char __user *filename,
+ 			const char __user *const __user *argv,
+ 			const char __user *const __user *envp, int flags);
+ asmlinkage long sys_userfaultfd(int flags);
+-asmlinkage long sys_membarrier(int cmd, unsigned int flags, int cpu_id);
++asmlinkage long sys_membarrier(int cmd, unsigned int flags, int cpu_id,
++			       unsigned long addr);
+ asmlinkage long sys_mlock2(unsigned long start, size_t len, int flags);
+ asmlinkage long sys_copy_file_range(int fd_in, loff_t __user *off_in,
+ 				    int fd_out, loff_t __user *off_out,
+diff --git a/include/uapi/linux/membarrier.h b/include/uapi/linux/membarrier.h
+index 5f3ad6d5be6f..e23b65bedd8b 100644
+--- a/include/uapi/linux/membarrier.h
++++ b/include/uapi/linux/membarrier.h
+@@ -140,6 +140,38 @@
+  * @MEMBARRIER_CMD_GET_REGISTRATIONS:
+  *                          Returns a bitmask of previously issued
+  *                          registration commands.
++ * @MEMBARRIER_CMD_SHARED_EXPEDITED_RSEQ:
++ *                          Execute a memory barrier and RSEQ fence on all
++ *                          running threads of all processes which
++ *                          (1) have a shared, writable mapping of the
++ *                          memory page containing @addr (the fourth
++ *                          system call argument) and (2) have registered
++ *                          their intent via
++ *                          MEMBARRIER_CMD_REGISTER_SHARED_EXPEDITED_RSEQ.
++ *                          The calling process must fulfill both
++ *                          requirements itself: @addr must be inside a
++ *                          shared, writable mapping of the caller
++ *                          (-EINVAL otherwise) and the caller must be
++ *                          registered (-EPERM otherwise).
++ *                          Upon return from system call, the caller
++ *                          thread is ensured that all its running
++ *                          threads siblings, and all running threads of
++ *                          the targeted processes, have any currently
++ *                          active RSEQ critical sections restarted at
++ *                          the abort address before they execute further
++ *                          user space instructions, and have passed
++ *                          through a state with all memory accesses to
++ *                          user-space addresses matching program order
++ *                          between entry to and return from the system
++ *                          call (non-running threads are de facto in
++ *                          such a state).
++ * @MEMBARRIER_CMD_REGISTER_SHARED_EXPEDITED_RSEQ:
++ *                          Register the process intent to use and to be
++ *                          targeted by
++ *                          MEMBARRIER_CMD_SHARED_EXPEDITED_RSEQ.
++ *                          If this command is not implemented by an
++ *                          architecture, -EINVAL is returned.
++ *                          Returns 0 on success.
+  *
+  * Command to be passed to the membarrier system call. The commands need to
+  * be a single bit each, except for MEMBARRIER_CMD_QUERY which is assigned to
+@@ -157,6 +189,8 @@ enum membarrier_cmd {
+ 	MEMBARRIER_CMD_PRIVATE_EXPEDITED_RSEQ			= (1 << 7),
+ 	MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED_RSEQ		= (1 << 8),
+ 	MEMBARRIER_CMD_GET_REGISTRATIONS			= (1 << 9),
++	MEMBARRIER_CMD_SHARED_EXPEDITED_RSEQ			= (1 << 10),
++	MEMBARRIER_CMD_REGISTER_SHARED_EXPEDITED_RSEQ		= (1 << 11),
+ 
+ 	/* Alias for header backward compatibility. */
+ 	MEMBARRIER_CMD_SHARED			= MEMBARRIER_CMD_GLOBAL,
+diff --git a/kernel/sched/membarrier.c b/kernel/sched/membarrier.c
+index cb957b8f1946..5ea2647f593e 100644
+--- a/kernel/sched/membarrier.c
++++ b/kernel/sched/membarrier.c
+@@ -5,6 +5,8 @@
+  * membarrier system call
+  */
+ #include <uapi/linux/membarrier.h>
++#include <linux/pagemap.h>
++#include <linux/rmap.h>
+ #include "sched.h"
+ 
+ /*
+@@ -155,6 +157,14 @@
+ #define MEMBARRIER_PRIVATE_EXPEDITED_RSEQ_BITMASK	0
+ #endif
+ 
++#if defined(CONFIG_RSEQ) && defined(CONFIG_MMU)
++#define MEMBARRIER_SHARED_EXPEDITED_RSEQ_BITMASK		\
++	(MEMBARRIER_CMD_SHARED_EXPEDITED_RSEQ			\
++	| MEMBARRIER_CMD_REGISTER_SHARED_EXPEDITED_RSEQ)
++#else
++#define MEMBARRIER_SHARED_EXPEDITED_RSEQ_BITMASK	0
++#endif
++
+ #define MEMBARRIER_CMD_BITMASK						\
+ 	(MEMBARRIER_CMD_GLOBAL | MEMBARRIER_CMD_GLOBAL_EXPEDITED	\
+ 	| MEMBARRIER_CMD_REGISTER_GLOBAL_EXPEDITED			\
+@@ -162,6 +172,7 @@
+ 	| MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED			\
+ 	| MEMBARRIER_PRIVATE_EXPEDITED_SYNC_CORE_BITMASK		\
+ 	| MEMBARRIER_PRIVATE_EXPEDITED_RSEQ_BITMASK			\
++	| MEMBARRIER_SHARED_EXPEDITED_RSEQ_BITMASK			\
+ 	| MEMBARRIER_CMD_GET_REGISTRATIONS)
+ 
+ /*
+@@ -442,6 +453,179 @@ static int membarrier_private_expedited(int flags, int cpu_id)
+ 	return 0;
+ }
+ 
++#if defined(CONFIG_RSEQ) && defined(CONFIG_MMU)
++/**
++ * struct membarrier_shared_rseq_walk - rmap walk state for the shared RSEQ fence
++ * @mms:	Snapshot of each online CPU's current task's mm
++ * @cpumask:	Result mask of CPUs which need an RSEQ IPI
++ */
++struct membarrier_shared_rseq_walk {
++	struct mm_struct	**mms;
++	struct cpumask		*cpumask;
++};
++
++static bool membarrier_shared_rseq_rmap_one(struct folio *folio,
++					    struct vm_area_struct *vma,
++					    unsigned long address, void *priv)
++{
++	struct membarrier_shared_rseq_walk *walk = priv;
++	struct mm_struct *mm = vma->vm_mm;
++	int cpu;
++
++	/* Only shared and actually write mapped VMAs are eligible */
++	if ((vma->vm_flags & (VM_SHARED | VM_WRITE)) != (VM_SHARED | VM_WRITE))
++		return true;
++
++	/* Only processes which registered their intent are eligible */
++	if (!(atomic_read(&mm->membarrier_state) &
++	      MEMBARRIER_STATE_SHARED_EXPEDITED_RSEQ_READY))
++		return true;
++
++	for_each_online_cpu(cpu) {
++		if (walk->mms[cpu] == mm)
++			__cpumask_set_cpu(cpu, walk->cpumask);
++	}
++
++	return true;
++}
++
++/*
++ * Fence all tasks which are running on other CPUs and have a shared,
++ * writable mapping of the page containing @addr.
++ *
++ * The caller must have the page mapped shared and writable itself, which
++ * confines the reach of this operation to the group of processes which
++ * mutually trust each other with write access to the same memory
++ * anyway. The targets have registered their intent to participate, so
++ * this cannot disturb oblivious processes.
++ */
++static int membarrier_shared_expedited_rseq(unsigned long addr)
++{
++	struct mm_struct *mm = current->mm;
++	struct membarrier_shared_rseq_walk walk;
++	struct rmap_walk_control rwc = {
++		.rmap_one	= membarrier_shared_rseq_rmap_one,
++		.arg		= &walk,
++	};
++	struct mm_struct **mms __free(kfree) = NULL;
++	cpumask_var_t __free(free_cpumask_var) tmpmask = CPUMASK_VAR_NULL;
++	struct folio *folio;
++	struct page *page;
++	long ret;
++	int cpu;
++
++	if (!(atomic_read(&mm->membarrier_state) &
++	      MEMBARRIER_STATE_SHARED_EXPEDITED_RSEQ_READY))
++		return -EPERM;
++
++	/*
++	 * Pin the page through the caller's own mapping, which both
++	 * validates that the caller has write access and keeps the folio
++	 * alive across the rmap walk below.
++	 */
++	scoped_guard(mmap_read_lock, mm) {
++		struct vm_area_struct *vma = vma_lookup(mm, addr);
++
++		if (!vma || (vma->vm_flags & (VM_SHARED | VM_WRITE)) !=
++			    (VM_SHARED | VM_WRITE))
++			return -EINVAL;
++
++		ret = get_user_pages(addr, 1, FOLL_WRITE, &page);
++		if (ret != 1)
++			return ret < 0 ? ret : -EFAULT;
++	}
++	folio = page_folio(page);
++
++	mms = kcalloc(nr_cpu_ids, sizeof(*mms), GFP_KERNEL);
++	if (!mms || !zalloc_cpumask_var(&tmpmask, GFP_KERNEL)) {
++		put_page(page);
++		return -ENOMEM;
++	}
++
++	walk.mms = mms;
++	walk.cpumask = tmpmask;
++
++	scoped_guard(mb) {
++		SERIALIZE_IPI();
++		guard(cpus_read_lock)();
++
++		/*
++		 * Snapshot the mm of each online CPU's current task.
++		 *
++		 * The snapshot is compared against the mms of the VMAs
++		 * mapping the pinned folio after the RCU read section
++		 * ends, so a snapshotted mm pointer might already be
++		 * freed and reused by the time it is compared. Such a
++		 * false positive results in a spurious, but harmless,
++		 * RSEQ IPI for whatever runs on that CPU then: the CPU
++		 * was reallocated to a new task through the scheduler,
++		 * which already implies the required RSEQ event and the
++		 * memory barriers.
++		 *
++		 * A task which starts running on a CPU after the
++		 * snapshot equally went through the scheduler after the
++		 * fence started, so skipping it is correct as well.
++		 */
++		scoped_guard(rcu) {
++			for_each_online_cpu(cpu) {
++				struct task_struct *p;
++
++				p = rcu_dereference(cpu_rq(cpu)->curr);
++				if (p && p->mm)
++					walk.mms[cpu] = p->mm;
++			}
++		}
++
++		/*
++		 * Walk all mappings of the pinned folio and collect the
++		 * CPUs which currently run tasks of eligible mms.
++		 */
++		folio_lock(folio);
++		rmap_walk(folio, &rwc);
++		folio_unlock(folio);
++
++		preempt_disable();
++		smp_call_function_many(tmpmask, ipi_rseq, NULL, true);
++		preempt_enable();
++	}
++
++	put_page(page);
++	return 0;
++}
++
++static int membarrier_register_shared_expedited_rseq(void)
++{
++	struct mm_struct *mm = current->mm;
++
++	if (atomic_read(&mm->membarrier_state) &
++	    MEMBARRIER_STATE_SHARED_EXPEDITED_RSEQ_READY)
++		return 0;
++	atomic_or(MEMBARRIER_STATE_SHARED_EXPEDITED_RSEQ, &mm->membarrier_state);
++
++	/*
++	 * Unlike the other registrations no runqueue state has to be
++	 * updated, as eligibility is solely based on mm::membarrier_state,
++	 * which a concurrent fence reads after the atomic_or() above is
++	 * globally visible: ensure that no memory access following the
++	 * registration is reordered before the registration.
++	 */
++	smp_mb__after_atomic();
++
++	atomic_or(MEMBARRIER_STATE_SHARED_EXPEDITED_RSEQ_READY,
++		  &mm->membarrier_state);
++	return 0;
++}
++#else  /* CONFIG_RSEQ && CONFIG_MMU */
++static int membarrier_shared_expedited_rseq(unsigned long addr)
++{
++	return -EINVAL;
++}
++static int membarrier_register_shared_expedited_rseq(void)
++{
++	return -EINVAL;
++}
++#endif /* !(CONFIG_RSEQ && CONFIG_MMU) */
++
+ static int sync_runqueues_membarrier_state(struct mm_struct *mm)
+ {
+ 	int membarrier_state = atomic_read(&mm->membarrier_state);
+@@ -574,13 +758,16 @@ static int membarrier_get_registrations(void)
+ 		MEMBARRIER_STATE_PRIVATE_EXPEDITED_SYNC_CORE |
+ 			MEMBARRIER_STATE_PRIVATE_EXPEDITED_SYNC_CORE_READY,
+ 		MEMBARRIER_STATE_PRIVATE_EXPEDITED_RSEQ |
+-			MEMBARRIER_STATE_PRIVATE_EXPEDITED_RSEQ_READY
++			MEMBARRIER_STATE_PRIVATE_EXPEDITED_RSEQ_READY,
++		MEMBARRIER_STATE_SHARED_EXPEDITED_RSEQ |
++			MEMBARRIER_STATE_SHARED_EXPEDITED_RSEQ_READY
+ 	};
+ 	static const int registration_cmds[] = {
+ 		MEMBARRIER_CMD_REGISTER_GLOBAL_EXPEDITED,
+ 		MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED,
+ 		MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED_SYNC_CORE,
+-		MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED_RSEQ
++		MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED_RSEQ,
++		MEMBARRIER_CMD_REGISTER_SHARED_EXPEDITED_RSEQ
+ 	};
+ 	BUILD_BUG_ON(ARRAY_SIZE(states) != ARRAY_SIZE(registration_cmds));
+ 
+@@ -606,6 +793,12 @@ static int membarrier_get_registrations(void)
+  * @cpu_id: if @flags == MEMBARRIER_CMD_FLAG_CPU, indicates the cpu on which
+  *          RSEQ CS should be interrupted (@cmd must be
+  *          MEMBARRIER_CMD_PRIVATE_EXPEDITED_RSEQ).
++ * @addr:   for MEMBARRIER_CMD_SHARED_EXPEDITED_RSEQ, a user space address
++ *          inside a shared writable mapping of the caller. All processes
++ *          which registered with
++ *          MEMBARRIER_CMD_REGISTER_SHARED_EXPEDITED_RSEQ and share a
++ *          writable mapping of the page containing @addr are targeted.
++ *          Ignored by all other commands.
+  *
+  * If this system call is not implemented, -ENOSYS is returned. If the
+  * command specified does not exist, not available on the running
+@@ -631,7 +824,8 @@ static int membarrier_get_registrations(void)
+  *        smp_mb()           X           O            O
+  *        sys_membarrier()   O           O            O
+  */
+-SYSCALL_DEFINE3(membarrier, int, cmd, unsigned int, flags, int, cpu_id)
++SYSCALL_DEFINE4(membarrier, int, cmd, unsigned int, flags, int, cpu_id,
++		unsigned long, addr)
+ {
+ 	switch (cmd) {
+ 	case MEMBARRIER_CMD_PRIVATE_EXPEDITED_RSEQ:
+@@ -680,6 +874,10 @@ SYSCALL_DEFINE3(membarrier, int, cmd, unsigned int, flags, int, cpu_id)
+ 		return membarrier_register_private_expedited(MEMBARRIER_FLAG_RSEQ);
+ 	case MEMBARRIER_CMD_GET_REGISTRATIONS:
+ 		return membarrier_get_registrations();
++	case MEMBARRIER_CMD_SHARED_EXPEDITED_RSEQ:
++		return membarrier_shared_expedited_rseq(addr);
++	case MEMBARRIER_CMD_REGISTER_SHARED_EXPEDITED_RSEQ:
++		return membarrier_register_shared_expedited_rseq();
+ 	default:
+ 		return -EINVAL;
+ 	}
+-- 
+2.54.0
+

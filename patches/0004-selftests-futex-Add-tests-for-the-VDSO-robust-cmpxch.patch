@@ -1,0 +1,316 @@
+From b4b4edb38b34c6edc8a72dc9a35824caa02a2546 Mon Sep 17 00:00:00 2001
+From: Keno Fischer <keno@juliahub.com>
+Date: Thu, 16 Jul 2026 08:22:51 +0000
+Subject: [PATCH 4/6] selftests/futex: Add tests for the VDSO robust cmpxchg
+ RSEQ operations
+
+Exercise __vdso_futex_robust_list{64,32}_cmpxchg_rseq():
+
+  - Failure when no RSEQ critical section is armed.
+
+  - Uncontended acquisition: lock word contains the cookie and the
+    pending op stays armed for the caller to disarm after queueing the
+    entry.
+
+  - Contended failure: pending op is disarmed and the lock word is left
+    alone.
+
+  - A signal storm stress test verifying on every iteration that a
+    successful return implies the cookie is in the lock word (an abort
+    fixup is never applied to a committed operation) and that a failed
+    return implies the pending op is disarmed and the free lock word was
+    not touched (a stale reservation is never published).
+
+The tests register their own rseq TLS area and fall back to the glibc
+provided registration via __rseq_offset on libcs which register rseq on
+their own.
+
+Signed-off-by: Keno Fischer <keno@juliahub.com>
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+---
+ .../selftests/futex/functional/robust_list.c  | 264 ++++++++++++++++++
+ 1 file changed, 264 insertions(+)
+
+diff --git a/tools/testing/selftests/futex/functional/robust_list.c b/tools/testing/selftests/futex/functional/robust_list.c
+index f4ceab854ca2..1ce653da8c3b 100644
+--- a/tools/testing/selftests/futex/functional/robust_list.c
++++ b/tools/testing/selftests/futex/functional/robust_list.c
+@@ -37,6 +37,7 @@
+ #include <stddef.h>
+ #include <sys/auxv.h>
+ #include <sys/mman.h>
++#include <sys/time.h>
+ #include <sys/wait.h>
+ 
+ #define STACK_SIZE (1024 * 1024)
+@@ -1249,4 +1250,267 @@ TEST(test_pidns_cookie)
+ 	pidns_collision_test(_metadata, true);
+ }
+ 
++/*
++ * Tests for the RSEQ guarded VDSO lock functions:
++ *
++ *	__vdso_futex_robust_list64_cmpxchg_rseq(u64 *pending_ptr, u64 pending,
++ *						u32 *lock, u32 expect, u32 set,
++ *						struct rseq *rseq)
++ *	__vdso_futex_robust_list32_cmpxchg_rseq(u32 *pending_ptr, u32 pending, ...)
++ */
++
++#define RSEQ_SIG	0x53053053
++
++/* Weak references for glibc >= 2.35 which registers rseq on its own */
++extern __attribute__((weak)) ptrdiff_t __rseq_offset;
++extern __attribute__((weak)) unsigned int __rseq_size;
++
++static __thread struct rseq_abi {
++	uint32_t cpu_id_start;
++	uint32_t cpu_id;
++	uint64_t rseq_cs;
++	uint32_t flags;
++} __attribute__((aligned(32))) own_rseq;
++
++struct rseq_cs_abi {
++	uint32_t version;
++	uint32_t flags;
++	uint64_t start_ip;
++	uint64_t post_commit_offset;
++	uint64_t abort_ip;
++} __attribute__((aligned(32)));
++
++/*
++ * An "empty" descriptor: the IP range never contains any executed code,
++ * so any RSEQ event simply clears TLS::rseq::rseq_cs. This is the
++ * "RSEQ event since the descriptor was armed" detector which the VDSO
++ * cmpxchg functions build upon.
++ */
++static const struct rseq_cs_abi empty_cs = {
++	.start_ip = 4096,
++	.post_commit_offset = 0,
++};
++
++static void *thread_pointer(void)
++{
++	void *tp;
++
++#if defined(__x86_64__)
++	asm("mov %%fs:0, %0" : "=r" (tp));
++#elif defined(__i386__)
++	asm("mov %%gs:0, %0" : "=r" (tp));
++#else
++	tp = __builtin_thread_pointer();
++#endif
++	return tp;
++}
++
++static struct rseq_abi *register_rseq(void)
++{
++	if (!syscall(SYS_rseq, &own_rseq, sizeof(own_rseq), 0, RSEQ_SIG))
++		return &own_rseq;
++
++	if (errno == EBUSY && &__rseq_offset && __rseq_size) {
++		return (struct rseq_abi *)((char *)thread_pointer() +
++					   __rseq_offset);
++	}
++	return NULL;
++}
++
++FIXTURE(vdso_cmpxchg)
++{
++	uint32_t (*vdso)(void *pending_ptr, uint64_t pending, _Atomic(uint32_t) *lock,
++			 uint32_t expect, uint32_t set, volatile struct rseq_abi *rseq);
++	struct rseq_abi *rseq;
++};
++
++FIXTURE_VARIANT(vdso_cmpxchg)
++{
++	const char *vdso_name;
++	bool size32;
++};
++
++FIXTURE_VARIANT_ADD(vdso_cmpxchg, 32)
++{
++	.vdso_name = "__vdso_futex_robust_list32_cmpxchg_rseq",
++	.size32 = true,
++};
++
++#ifdef BUILD_64
++FIXTURE_VARIANT_ADD(vdso_cmpxchg, 64)
++{
++	.vdso_name = "__vdso_futex_robust_list64_cmpxchg_rseq",
++	.size32 = false,
++};
++#endif
++
++FIXTURE_SETUP(vdso_cmpxchg)
++{
++	self->vdso = get_vdso_func_addr(variant->vdso_name);
++	if (!self->vdso)
++		SKIP(return, "%s not found in vDSO", variant->vdso_name);
++
++	self->rseq = register_rseq();
++	if (!self->rseq)
++		SKIP(return, "Cannot register or locate rseq TLS area");
++}
++
++FIXTURE_TEARDOWN(vdso_cmpxchg) {}
++
++/*
++ * Wrappers to invoke the correctly typed function and to check the
++ * pending op state independent of the pointer size.
++ */
++static union {
++	uint64_t u64;
++	uint32_t u32;
++} pend_slot;
++
++static uint32_t do_cmpxchg(FIXTURE_DATA(vdso_cmpxchg) *self,
++			   const FIXTURE_VARIANT(vdso_cmpxchg) *variant,
++			   uint64_t pending, _Atomic(uint32_t) *lock,
++			   uint32_t expect, uint32_t set)
++{
++	if (variant->size32) {
++		uint32_t (*fn)(uint32_t *, uint32_t, _Atomic(uint32_t) *, uint32_t,
++			       uint32_t, volatile struct rseq_abi *) = (void *)self->vdso;
++
++		return fn(&pend_slot.u32, (uint32_t)pending, lock, expect,
++			  set, self->rseq);
++	}
++	return self->vdso(&pend_slot.u64, pending, lock, expect, set, self->rseq);
++}
++
++static uint64_t get_pending(const FIXTURE_VARIANT(vdso_cmpxchg) *variant)
++{
++	if (variant->size32)
++		return pend_slot.u32;
++	return pend_slot.u64;
++}
++
++#define TEST_COOKIE	0x00c0ff33U
++#define TEST_PENDING	0x1000ULL
++
++/*
++ * Without an armed rseq_cs the function must fail and leave everything
++ * alone.
++ */
++TEST_F(vdso_cmpxchg, no_rseq_cs)
++{
++	_Atomic(uint32_t) lock = 0;
++	uint32_t ret;
++
++	pend_slot.u64 = 0;
++	self->rseq->rseq_cs = 0;
++
++	ret = do_cmpxchg(self, variant, TEST_PENDING, &lock, 0, TEST_COOKIE);
++	ASSERT_EQ(ret, 0);
++	ASSERT_EQ(atomic_load(&lock), 0);
++	ASSERT_EQ(get_pending(variant), 0);
++}
++
++/*
++ * Uncontended acquisition: the lock word gets the cookie and the pending
++ * op stays armed until the caller disarms it.
++ */
++TEST_F(vdso_cmpxchg, uncontended)
++{
++	_Atomic(uint32_t) lock = 0;
++	uint32_t ret;
++
++	pend_slot.u64 = 0;
++	self->rseq->rseq_cs = (uintptr_t)&empty_cs;
++
++	ret = do_cmpxchg(self, variant, TEST_PENDING, &lock, 0, TEST_COOKIE);
++	self->rseq->rseq_cs = 0;
++
++	ASSERT_EQ(ret, 1);
++	ASSERT_EQ(atomic_load(&lock), TEST_COOKIE);
++	ASSERT_EQ(get_pending(variant), TEST_PENDING);
++	pend_slot.u64 = 0;
++}
++
++/*
++ * Contended lock: the cmpxchg fails, the pending op must be disarmed.
++ */
++TEST_F(vdso_cmpxchg, contended)
++{
++	_Atomic(uint32_t) lock = 0xdead0001;
++	uint32_t ret;
++
++	pend_slot.u64 = 0;
++	self->rseq->rseq_cs = (uintptr_t)&empty_cs;
++
++	ret = do_cmpxchg(self, variant, TEST_PENDING, &lock, 0, TEST_COOKIE);
++	self->rseq->rseq_cs = 0;
++
++	ASSERT_EQ(ret, 0);
++	ASSERT_EQ(atomic_load(&lock), 0xdead0001);
++	ASSERT_EQ(get_pending(variant), 0);
++}
++
++static volatile sig_atomic_t sig_count;
++
++static void sigalrm_handler(int sig)
++{
++	sig_count++;
++}
++
++/*
++ * Signal storm stress: while SIGALRM fires at high frequency, acquire
++ * and release the lock in a tight loop. Signals landing between arming
++ * rseq_cs and the cmpxchg abort the operation via the kernel fixup.
++ *
++ * Invariants checked on every iteration:
++ *
++ *  - Success implies the lock word contains the cookie (an abort fixup
++ *    must never be applied to a committed operation).
++ *
++ *  - Failure implies the pending op has been disarmed, and since there
++ *    is no other contender, the lock word must still be free.
++ */
++TEST_F(vdso_cmpxchg, signal_abort_stress)
++{
++	struct itimerval it = {
++		.it_interval = { .tv_usec = 200 },
++		.it_value = { .tv_usec = 200 },
++	};
++	struct sigaction sa = { .sa_handler = sigalrm_handler };
++	_Atomic(uint32_t) lock = 0;
++	unsigned long success = 0, aborts = 0;
++	uint32_t ret;
++
++	ASSERT_EQ(sigaction(SIGALRM, &sa, NULL), 0);
++	ASSERT_EQ(setitimer(ITIMER_REAL, &it, NULL), 0);
++
++	sig_count = 0;
++	while (sig_count < 2000) {
++		pend_slot.u64 = 0;
++		self->rseq->rseq_cs = (uintptr_t)&empty_cs;
++		ret = do_cmpxchg(self, variant, TEST_PENDING, &lock, 0, TEST_COOKIE);
++		self->rseq->rseq_cs = 0;
++
++		if (ret) {
++			success++;
++			ASSERT_EQ(atomic_load(&lock), TEST_COOKIE);
++			ASSERT_EQ(get_pending(variant), TEST_PENDING);
++			/* Release the lock */
++			atomic_store(&lock, 0);
++			pend_slot.u64 = 0;
++		} else {
++			aborts++;
++			ASSERT_EQ(get_pending(variant), 0);
++			ASSERT_EQ(atomic_load(&lock), 0);
++		}
++	}
++
++	it.it_interval.tv_usec = 0;
++	it.it_value.tv_usec = 0;
++	ASSERT_EQ(setitimer(ITIMER_REAL, &it, NULL), 0);
++
++	ksft_print_msg("%s: %lu acquisitions, %lu aborts\n", __func__, success, aborts);
++	ASSERT_GT(success, 0);
++	ASSERT_GT(aborts, 0);
++}
++
+ TEST_HARNESS_MAIN
+-- 
+2.54.0
+

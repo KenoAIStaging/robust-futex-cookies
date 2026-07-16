@@ -1,0 +1,528 @@
+From c4764b8c3ae2959f9dfaf4f649b0f3cbd3ccf4df Mon Sep 17 00:00:00 2001
+From: Keno Fischer <keno@juliahub.com>
+Date: Thu, 16 Jul 2026 08:20:22 +0000
+Subject: [PATCH 2/6] selftests/futex: Add robust list cookie tests
+
+Exercise the ROBUST_LIST_COOKIE extension:
+
+  - Registration size and flags validation, including the
+    sys_get_robust_list() size reporting for both head versions.
+
+  - Exit time cleanup with matching cookies for both regular list
+    entries and list_op_pending: FUTEX_OWNER_DIED is set and a waiter is
+    woken.
+
+  - Exit time cleanup with mismatched cookies: a futex which appears to
+    be owned by somebody else must be left untouched.
+
+  - The actual PID namespace ambiguity scenario: two processes in
+    different PID namespaces observe the same namespace local TID. One
+    owns the lock, the other dies with list_op_pending pointing at it.
+    The TID based variant documents the resulting corruption of the
+    perfectly valid lock, the cookie based variant proves the lock is
+    left alone.
+
+Also widen the grace periods of the documented wait vs. exit races so
+the tests are reliable in slow emulated environments, and raise the
+futex_wait() timeout accordingly.
+
+Signed-off-by: Keno Fischer <keno@juliahub.com>
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+---
+ .../selftests/futex/functional/robust_list.c  | 467 +++++++++++++++++-
+ 1 file changed, 464 insertions(+), 3 deletions(-)
+
+diff --git a/tools/testing/selftests/futex/functional/robust_list.c b/tools/testing/selftests/futex/functional/robust_list.c
+index b3fab60181d5..f4ceab854ca2 100644
+--- a/tools/testing/selftests/futex/functional/robust_list.c
++++ b/tools/testing/selftests/futex/functional/robust_list.c
+@@ -41,9 +41,13 @@
+ 
+ #define STACK_SIZE (1024 * 1024)
+ 
+-#define FUTEX_TIMEOUT 3
++#define FUTEX_TIMEOUT 10
+ 
+-#define SLEEP_US 100
++/*
++ * Grace period for the documented wait vs. exit races below. Generous, so
++ * the tests are reliable in slow emulated environments as well.
++ */
++#define SLEEP_US 10000
+ 
+ #if __SIZEOF_LONG__ == 8
+ # define BUILD_64
+@@ -268,7 +272,12 @@ TEST(test_set_robust_list_invalid_size)
+ 	ret = set_robust_list(&head, head_size);
+ 	ASSERT_EQ(ret, 0);
+ 
+-	ret = set_robust_list(&head, head_size * 2);
++	/*
++	 * head_size * 2 happens to be the size of the extended
++	 * struct robust_list_head2 on 64-bit, so use * 3 for an
++	 * invalid size.
++	 */
++	ret = set_robust_list(&head, head_size * 3);
+ 	ASSERT_EQ(ret, -1);
+ 	ASSERT_EQ(errno, EINVAL);
+ 
+@@ -788,4 +797,456 @@ TEST_F(futex_op, test_futex_robust_unlock)
+ 	ASSERT_EQ((uintptr_t)(unsigned long)head.list_op_pending, exp);
+ }
+ 
++/*
++ * Robust list cookie tests.
++ *
++ * With ROBUST_LIST_COOKIE set in robust_list_head2::flags, the owner
++ * comparison of the exit time cleanup uses a per entry user space managed
++ * 32-bit cookie located at robust_list_head2::cookie_offset relative to
++ * the entry instead of the TID of the exiting task. This makes robust
++ * futexes usable across PID namespaces where TIDs are ambiguous.
++ */
++#ifndef ROBUST_LIST_COOKIE
++struct robust_list_head2 {
++	struct robust_list_head head;
++	unsigned long flags;
++	long cookie_offset;
++	uint32_t list_op_pending_cookie;
++	uint32_t __reserved;
++};
++# define ROBUST_LIST_COOKIE	(0x1UL)
++#endif
++
++struct lock_struct2 {
++	_Atomic(unsigned int)	futex;
++	struct robust_list	list;
++	uint32_t		cookie;
++};
++
++/*
++ * Helper function to prepare and register a robust list with cookies
++ */
++static int set_list2(struct robust_list_head2 *head, unsigned long flags)
++{
++	int ret;
++
++	head->flags = flags;
++	head->cookie_offset = (ssize_t) offsetof(struct lock_struct2, cookie) -
++			      (ssize_t) offsetof(struct lock_struct2, list);
++	head->head.futex_offset = (ssize_t) offsetof(struct lock_struct2, futex) -
++				  (ssize_t) offsetof(struct lock_struct2, list);
++	head->head.list.next = &head->head.list;
++	head->head.list_op_pending = NULL;
++	head->list_op_pending_cookie = 0;
++	head->__reserved = 0;
++
++	ret = set_robust_list((struct robust_list_head *)head, sizeof(*head));
++	if (ret)
++		return ret;
++
++	return 0;
++}
++
++/*
++ * Take the lock with @cookie as owner identifier and insert it into the
++ * robust list. With @error_inject the entry is left as list_op_pending to
++ * exercise the pending op handling at exit.
++ *
++ * The pending phase of the lock operation is attributed via the thread
++ * private robust_list_head2::list_op_pending_cookie. The entry cookie is
++ * only written after the lock has been acquired, when this thread is the
++ * exclusive owner of the entry.
++ */
++static int mutex_lock_cookie(struct lock_struct2 *lock, struct robust_list_head2 *head,
++			     uint32_t cookie, bool error_inject)
++{
++	_Atomic(unsigned int) *futex = &lock->futex;
++	unsigned int zero = 0;
++
++	head->list_op_pending_cookie = cookie;
++	head->head.list_op_pending = &lock->list;
++
++	if (!atomic_compare_exchange_strong(futex, &zero, cookie)) {
++		head->head.list_op_pending = NULL;
++		return -1;
++	}
++
++	lock->cookie = cookie;
++
++	/* Error injection to test list_op_pending handling */
++	if (error_inject)
++		return 0;
++
++	lock->list.next = head->head.list.next;
++	head->head.list.next = &lock->list;
++
++	head->head.list_op_pending = NULL;
++
++	return 0;
++}
++
++/*
++ * Wait for the lock to be released (or the owner to die), with timeout.
++ */
++static int cookie_lock_wait(struct lock_struct2 *lock)
++{
++	_Atomic(unsigned int) *futex = &lock->futex;
++	struct timespec to;
++	unsigned int val;
++
++	to.tv_sec = FUTEX_TIMEOUT;
++	to.tv_nsec = 0;
++
++	val = atomic_load(futex) | FUTEX_WAITERS;
++	atomic_store(futex, val);
++
++	return futex_wait((futex_t *) futex, val, &to, 0);
++}
++
++/*
++ * Invalid and valid registrations of the extended robust list head
++ */
++TEST(test_set_robust_list2_flags)
++{
++	struct robust_list_head2 head;
++	struct robust_list_head *get_head;
++	size_t len;
++	int ret;
++
++	/* Sizes between the two known versions are invalid */
++	ret = set_robust_list((struct robust_list_head *)&head,
++			      sizeof(struct robust_list_head) + 1);
++	ASSERT_EQ(ret, -1);
++	ASSERT_EQ(errno, EINVAL);
++
++	/* Unknown flags are rejected */
++	head.flags = ~0UL;
++	ret = set_robust_list((struct robust_list_head *)&head, sizeof(head));
++	ASSERT_EQ(ret, -1);
++	ASSERT_EQ(errno, EINVAL);
++
++	/* Valid flags are accepted and the registered size is reported */
++	ret = set_list2(&head, ROBUST_LIST_COOKIE);
++	ASSERT_EQ(ret, 0);
++
++	ret = get_robust_list(0, &get_head, &len);
++	ASSERT_EQ(ret, 0);
++	ASSERT_EQ(get_head, (struct robust_list_head *)&head);
++	ASSERT_EQ(len, sizeof(head));
++
++	/* A v1 registration is reported with the original size again */
++	ret = set_robust_list((struct robust_list_head *)&head,
++			      sizeof(struct robust_list_head));
++	ASSERT_EQ(ret, 0);
++
++	ret = get_robust_list(0, &get_head, &len);
++	ASSERT_EQ(ret, 0);
++	ASSERT_EQ(len, sizeof(struct robust_list_head));
++
++	ksft_test_result_pass("%s\n", __func__);
++}
++
++#define COOKIE_A	0x00abc123U
++#define COOKIE_B	0x00def456U
++
++struct cookie_child_args {
++	struct lock_struct2	*lock;
++	uint32_t		lock_cookie;
++	uint32_t		entry_cookie;
++	bool			error_inject;
++};
++
++/*
++ * Child takes the lock with @lock_cookie in the futex word, but registers
++ * @entry_cookie in the robust list entry, and dies. Mismatched cookies
++ * emulate a lock which is owned by some other process.
++ */
++static int child_fn_lock_cookie(void *arg)
++{
++	struct cookie_child_args *args = arg;
++	struct lock_struct2 *lock = args->lock;
++	struct robust_list_head2 head;
++	int ret;
++
++	ret = set_list2(&head, ROBUST_LIST_COOKIE);
++	if (ret) {
++		ksft_test_result_fail("set_robust_list v2 error\n");
++		return ret;
++	}
++
++	ret = mutex_lock_cookie(lock, &head, args->lock_cookie, args->error_inject);
++	if (ret) {
++		ksft_test_result_fail("mutex_lock_cookie error\n");
++		return ret;
++	}
++
++	/*
++	 * Emulate a foreign owner in the futex word: this task's cookie
++	 * (in the queued entry and in the pending cookie) does not match
++	 * the futex value.
++	 */
++	if (args->entry_cookie != args->lock_cookie) {
++		lock->cookie = args->entry_cookie;
++		head.list_op_pending_cookie = args->entry_cookie;
++	}
++
++	pthread_barrier_wait(&barrier);
++
++	/* See comment at child_fn_lock() */
++	usleep(SLEEP_US);
++
++	return 0;
++}
++
++static void cookie_robustness_test(struct __test_metadata *_metadata,
++				   uint32_t lock_cookie, uint32_t entry_cookie,
++				   bool error_inject)
++{
++	struct lock_struct2 lock = { .futex = 0 };
++	_Atomic(unsigned int) *futex = &lock.futex;
++	struct cookie_child_args args = {
++		.lock		= &lock,
++		.lock_cookie	= lock_cookie,
++		.entry_cookie	= entry_cookie,
++		.error_inject	= error_inject,
++	};
++	bool match = lock_cookie == entry_cookie;
++	int ret, pid, wstatus;
++
++	ret = pthread_barrier_init(&barrier, NULL, 2);
++	ASSERT_EQ(ret, 0);
++
++	pid = create_child(&child_fn_lock_cookie, &args);
++	ASSERT_NE(pid, -1);
++
++	pthread_barrier_wait(&barrier);
++	ret = cookie_lock_wait(&lock);
++
++	if (match) {
++		/*
++		 * The dying child owned the lock: the kernel sets
++		 * FUTEX_OWNER_DIED and wakes this waiter.
++		 */
++		ASSERT_EQ(ret, 0);
++		ASSERT_TRUE(atomic_load(futex) & FUTEX_OWNER_DIED);
++	} else {
++		/*
++		 * The lock looks foreign owned: the kernel must not touch
++		 * it, so the wait times out.
++		 */
++		ASSERT_EQ(ret, -1);
++		ASSERT_EQ(errno, ETIMEDOUT);
++		ASSERT_FALSE(atomic_load(futex) & FUTEX_OWNER_DIED);
++		ASSERT_EQ(atomic_load(futex) & FUTEX_TID_MASK, lock_cookie);
++	}
++
++	wait(&wstatus);
++	pthread_barrier_destroy(&barrier);
++
++	if (!WEXITSTATUS(wstatus))
++		ksft_test_result_pass("%s\n", __func__);
++}
++
++/*
++ * Same as test_robustness, but with cookie based owner identification
++ */
++TEST(test_robustness_cookie)
++{
++	cookie_robustness_test(_metadata, COOKIE_A, COOKIE_A, false);
++}
++
++/*
++ * The dying task's entry cookie does not match the futex word: the futex
++ * belongs to somebody else and must not be marked FUTEX_OWNER_DIED.
++ */
++TEST(test_robustness_cookie_mismatch)
++{
++	cookie_robustness_test(_metadata, COOKIE_A, COOKIE_B, false);
++}
++
++/*
++ * list_op_pending handling with matching and mismatched cookies
++ */
++TEST(test_list_op_pending_cookie)
++{
++	cookie_robustness_test(_metadata, COOKIE_A, COOKIE_A, true);
++}
++
++TEST(test_list_op_pending_cookie_mismatch)
++{
++	cookie_robustness_test(_metadata, COOKIE_A, COOKIE_B, true);
++}
++
++/*
++ * PID namespace ambiguity test.
++ *
++ * Two processes in different PID namespaces get the same namespace local
++ * TID. Process A owns the lock. Process B dies with list_op_pending
++ * pointing to the lock, emulating death in the middle of a lock attempt.
++ *
++ * With TID based robust lists, the kernel wrongly attributes A's lock to
++ * the dying B, because B's namespace local TID matches the futex value,
++ * and corrupts the still perfectly owned lock with FUTEX_OWNER_DIED.
++ *
++ * With cookie based robust lists, B's pending entry carries B's unique
++ * cookie, the owner comparison fails and the lock is left alone.
++ */
++struct pidns_child_args {
++	struct lock_struct2	*lock;
++	bool			cookies;
++	uint32_t		cookie;
++	bool			take_lock;
++	_Atomic(int)		*ready;
++	_Atomic(int)		*release;
++};
++
++static int child_fn_pidns(void *arg)
++{
++	struct pidns_child_args *args = arg;
++	struct lock_struct2 *lock = args->lock;
++	struct robust_list_head2 head2;
++	struct robust_list_head head;
++	uint32_t owner_id;
++	int ret;
++
++	/* Both children must observe the same namespace local TID */
++	if (gettid() != 1)
++		return 1;
++
++	if (args->cookies) {
++		ret = set_list2(&head2, ROBUST_LIST_COOKIE);
++		owner_id = args->cookie;
++	} else {
++		ret = set_list(&head);
++		owner_id = gettid();
++	}
++	if (ret)
++		return 1;
++
++	if (args->take_lock) {
++		/* Take the lock and wait for release */
++		unsigned int zero = 0;
++
++		lock->cookie = owner_id;
++		if (!atomic_compare_exchange_strong(&lock->futex, &zero, owner_id))
++			return 1;
++
++		atomic_store(args->ready, 1);
++		futex_wait((futex_t *) args->release, 0, NULL, 0);
++		return 0;
++	}
++
++	/*
++	 * Emulate death in the middle of a lock attempt: list_op_pending
++	 * set, lock owned by somebody else. The entry cookie belongs to
++	 * the lock owner and is not touched.
++	 */
++	if (args->cookies) {
++		head2.list_op_pending_cookie = owner_id;
++		head2.head.list_op_pending = &lock->list;
++	} else {
++		head.list_op_pending = &lock->list;
++	}
++
++	atomic_store(args->ready, 1);
++	/* Die with the pending op set */
++	return 0;
++}
++
++static void pidns_collision_test(struct __test_metadata *_metadata, bool cookies)
++{
++	struct lock_struct2 *lock;
++	_Atomic(int) *ready_a, *ready_b, *release;
++	struct pidns_child_args args_a, args_b;
++	unsigned int val;
++	int pid_a, pid_b, wstatus;
++	char *stack_a, *stack_b;
++
++	/* Shared state, the children only share the VM with the parent */
++	lock = mmap(NULL, 4096, PROT_READ | PROT_WRITE,
++		    MAP_SHARED | MAP_ANONYMOUS, -1, 0);
++	ASSERT_NE(lock, MAP_FAILED);
++
++	ready_a = (void *)(lock + 1);
++	ready_b = ready_a + 1;
++	release = ready_b + 1;
++
++	args_a = (struct pidns_child_args) {
++		.lock = lock, .cookies = cookies, .cookie = COOKIE_A,
++		.take_lock = true, .ready = ready_a, .release = release,
++	};
++	args_b = (struct pidns_child_args) {
++		.lock = lock, .cookies = cookies, .cookie = COOKIE_B,
++		.take_lock = false, .ready = ready_b, .release = release,
++	};
++
++	stack_a = mmap(NULL, STACK_SIZE, PROT_READ | PROT_WRITE,
++		       MAP_PRIVATE | MAP_ANONYMOUS | MAP_STACK, -1, 0);
++	ASSERT_NE(stack_a, MAP_FAILED);
++	stack_b = mmap(NULL, STACK_SIZE, PROT_READ | PROT_WRITE,
++		       MAP_PRIVATE | MAP_ANONYMOUS | MAP_STACK, -1, 0);
++	ASSERT_NE(stack_b, MAP_FAILED);
++
++	/* Each child is the first task of its own new PID namespace */
++	pid_a = clone(child_fn_pidns, stack_a + STACK_SIZE,
++		      CLONE_VM | CLONE_NEWPID | SIGCHLD, &args_a);
++	if (pid_a == -1 && (errno == EPERM || errno == EINVAL))
++		SKIP(return, "need CAP_SYS_ADMIN for CLONE_NEWPID");
++	ASSERT_NE(pid_a, -1);
++
++	/* Wait for A to hold the lock */
++	while (!atomic_load(ready_a))
++		usleep(SLEEP_US);
++
++	pid_b = clone(child_fn_pidns, stack_b + STACK_SIZE,
++		      CLONE_VM | CLONE_NEWPID | SIGCHLD, &args_b);
++	ASSERT_NE(pid_b, -1);
++
++	/* Wait for B to die with the pending op set */
++	while (!atomic_load(ready_b))
++		usleep(SLEEP_US);
++	ASSERT_EQ(waitpid(pid_b, &wstatus, 0), pid_b);
++	ASSERT_EQ(WEXITSTATUS(wstatus), 0);
++
++	/*
++	 * B is dead and the kernel processed B's robust list. A still
++	 * owns the lock.
++	 */
++	val = atomic_load(&lock->futex);
++
++	if (cookies) {
++		/* The lock must be untouched */
++		ASSERT_EQ(val, COOKIE_A);
++	} else {
++		/*
++		 * Document the TID ambiguity bug: B's namespace local TID
++		 * matches A's, so the kernel wrongly marks A's lock dead
++		 * (clearing the owner and setting FUTEX_OWNER_DIED).
++		 */
++		ASSERT_EQ(val, FUTEX_OWNER_DIED);
++	}
++
++	/* Release A */
++	atomic_store(release, 1);
++	futex_wake((futex_t *) release, 1, 0);
++	ASSERT_EQ(waitpid(pid_a, &wstatus, 0), pid_a);
++	ASSERT_EQ(WEXITSTATUS(wstatus), 0);
++
++	munmap(stack_a, STACK_SIZE);
++	munmap(stack_b, STACK_SIZE);
++	munmap(lock, 4096);
++
++	ksft_test_result_pass("%s\n", __func__);
++}
++
++TEST(test_pidns_tid_ambiguity)
++{
++	pidns_collision_test(_metadata, false);
++}
++
++TEST(test_pidns_cookie)
++{
++	pidns_collision_test(_metadata, true);
++}
++
+ TEST_HARNESS_MAIN
+-- 
+2.54.0
+

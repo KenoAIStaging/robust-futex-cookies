@@ -1,0 +1,803 @@
+From 2dce0f490d99c8626571319e2f64f96064893847 Mon Sep 17 00:00:00 2001
+From: Keno Fischer <keno@juliahub.com>
+Date: Thu, 16 Jul 2026 08:22:29 +0000
+Subject: [PATCH 3/6] futex/vdso: Implement
+ __vdso_futex_robust_list{64,32}_cmpxchg_rseq()
+
+Cookie based robust futexes (ROBUST_LIST_COOKIE) require user space to
+assign owner identifiers which are unique among all tasks sharing a
+lock. For POSIX style process shared mutexes a practical way to
+guarantee uniqueness without global coordination is a per lock
+reservation counter: each lock attempt reserves a fresh counter value as
+its cookie. As the counter is finite, reuse after a counter wrap must be
+prevented. That requires that a lock attempt whose reservation was
+outpaced by a counter epoch change can never store its stale cookie into
+the lock word afterwards.
+
+Provide VDSO functions which perform the user space lock acquisition of
+a cookie based robust futex:
+
+	*pending_ptr = NULL;
+	if (!rseq->rseq_cs)
+		return 0;
+	*pending_ptr = pending;
+	if (!atomic_try_cmpxchg(lock, &expect, set)) {
+		*pending_ptr = NULL;
+		return 0;
+	}
+	return 1;
+
+with guarantees which pure user space code cannot provide:
+
+ 1) The region between the rseq_cs check and the cmpxchg is atomic
+    versus RSEQ events. The caller stores a critical section descriptor,
+    whose IP range does not contain any executed code, into
+    TLS::rseq::rseq_cs before reserving the cookie. Any RSEQ event
+    (preemption, signal delivery, RSEQ IPI) clears rseq_cs, so the check
+    in the VDSO fails for a reservation which was interrupted before the
+    function was reached. For an event hitting inside the VDSO critical
+    section itself the kernel aborts the operation: it disarms the
+    robust list pending op and moves the task to the abort landing pad,
+    which makes the function return failure.
+
+    Together with a quiescing mechanism which fences off all tasks
+    sharing the lock (e.g. membarrier(), a subsequent change), this
+    guarantees that no stale reservation survives a counter epoch
+    change.
+
+ 2) Disarming the pending op after a failed cmpxchg is atomic versus
+    signal delivery, mirroring the __vdso_futex_robust_try_unlock()
+    protection. Otherwise a signal handler which does not return could
+    leave a stale pending op armed for an unbounded time, whose cookie
+    could eventually falsely match a later owner of the lock word at
+    exit time.
+
+ 3) A task which dies without ever returning to user space (unhandled
+    fatal signal: get_signal() invokes do_exit() directly, so neither
+    the RSEQ event processing nor the signal delivery fixups run) does
+    not leave an invalid pending op behind for the robust list exit walk
+    to misinterpret. Two windows are fixed up at exit time, before the
+    robust list is walked, by applying the signal delivery fixups
+    against the task's user register frame:
+
+      - Death inside the cmpxchg function before the cmpxchg committed:
+        the cookie reservation was never validated and can be stale.
+
+      - Death inside the try_unlock function after the unlock committed
+        but before the pending op was disarmed: the lock was released
+        and can have been legitimately re-acquired before the exit walk
+        runs.
+
+    In both cases a stale pending cookie can numerically match the
+    (wrapped) cookie of the current live owner of the lock, so
+    processing the pending op would misattribute the lock to the dead
+    task and corrupt it. TID based and unique cookie setups are immune,
+    as an identifier cannot be reused before the exit cleanup of its
+    previous holder has run, but for counter based cookies these fixups
+    are required for correctness. Both windows were found by model
+    checking the counter protocol with TLC: the first during model
+    construction, the second as a genuine model checker counterexample.
+
+On success the pending op stays armed with the cookie visible in both
+the lock word and the entry until the caller has queued the entry in the
+robust list, exactly like the list_op_pending protocol of the original
+robust list.
+
+The distinction whether a fixup is required is based on the Zero
+Flag. The rseq_cs check leaves ZF = 0 when it proceeds, MOV does not
+modify flags and a successful cmpxchg sets ZF = 1. So ZF = 0 within the
+critical section means the operation has not committed and must be
+aborted. ZF = 1 means the operation either committed or is on its way to
+the failure exit with the pending op already disarmed. In both cases no
+fixup is required.
+
+The abort fixup hooks into the RSEQ critical section handling: whenever
+an RSEQ event results in clearing TLS::rseq::rseq_cs because the
+instruction pointer is outside of the user space descriptor range, the
+kernel checks whether the IP is inside the VDSO cmpxchg critical section
+and applies the fixup. This covers preemption and interrupt induced
+events via the exit to user path, RSEQ IPIs from membarrier() and signal
+delivery via rseq_signal_deliver(). The clearing of the pending op via
+put_user() is best effort: if it fails due to a disabled pagefault
+handler, the abort landing pad in the VDSO disarms the pending op again
+in user space.
+
+The pending op pointer is in DX in all build modes, so the kernel side
+retrieval is uniform. As with the try_unlock functions two entry points
+are provided to support multi-size robust list pointers used by gaming
+emulators:
+
+	__vdso_futex_robust_list64_cmpxchg_rseq()
+	__vdso_futex_robust_list32_cmpxchg_rseq()
+
+The 32-bit VDSO provides only the list32 variant.
+
+Signed-off-by: Keno Fischer <keno@juliahub.com>
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+---
+ Documentation/locking/robust-futex-ABI.rst |   5 +-
+ arch/x86/entry/vdso/common/vfutex.c        | 126 +++++++++++++++++++++
+ arch/x86/entry/vdso/vdso32/vdso32.lds.S    |   1 +
+ arch/x86/entry/vdso/vdso64/vdso64.lds.S    |   2 +
+ arch/x86/entry/vdso/vdso64/vdsox32.lds.S   |   2 +
+ arch/x86/entry/vdso/vma.c                  |  12 ++
+ arch/x86/include/asm/futex_robust.h        |  15 +++
+ arch/x86/include/asm/vdso.h                |   6 +
+ arch/x86/tools/vdso2c.c                    |   6 +
+ include/linux/futex.h                      |  11 ++
+ include/linux/futex_types.h                |  18 ++-
+ include/linux/rseq_entry.h                 |  32 +++++-
+ include/vdso/futex.h                       |  83 ++++++++++++++
+ kernel/futex/core.c                        | 119 ++++++++++++++++++-
+ 14 files changed, 431 insertions(+), 7 deletions(-)
+
+diff --git a/Documentation/locking/robust-futex-ABI.rst b/Documentation/locking/robust-futex-ABI.rst
+index 662f0a693b85..e6e96ab23776 100644
+--- a/Documentation/locking/robust-futex-ABI.rst
++++ b/Documentation/locking/robust-futex-ABI.rst
+@@ -276,7 +276,10 @@ all tasks which can hold the lock, the same way TIDs are unique among
+ all tasks within one PID namespace. Uniqueness can be organized, for
+ instance, with allocation tables in the shared memory itself (with the
+ allocations guarded by robust futexes on the table slots), with OFD
+-file locks on a shared file, or with per lock reservation counters.
++file locks on a shared file, or with per lock reservation counters (see
++the ``__vdso_futex_robust_listXX_cmpxchg_rseq()`` documentation in
++``include/vdso/futex.h`` and ``MEMBARRIER_CMD_SHARED_EXPEDITED_RSEQ``
++for the required reservation validation machinery).
+ 
+ ``sys_get_robust_list()`` reports the size which was used at
+ registration time. Kernel assisted priority inheritance
+diff --git a/arch/x86/entry/vdso/common/vfutex.c b/arch/x86/entry/vdso/common/vfutex.c
+index 454f059278e4..abc6b4158bc9 100644
+--- a/arch/x86/entry/vdso/common/vfutex.c
++++ b/arch/x86/entry/vdso/common/vfutex.c
+@@ -26,6 +26,7 @@
+ #define __stringify(x...)	__stringify_1(x)
+ 
+ #define LABEL(prefix, which)	__stringify(prefix##_try_unlock_cs_##which:)
++#define LABEL2(prefix, which)	__stringify(prefix##_##which:)
+ 
+ #define JNZ_END(prefix)		"jnz " __stringify(prefix) "_try_unlock_cs_end\n"
+ 
+@@ -69,3 +70,128 @@ __u32 __vdso_futex_robust_list32_try_unlock(__u32 *lock, __u32 tid, __u32 *pop)
+ 	return futex_robust_try_unlock(__futex_list32, CLEAR_POPL, lock, tid, pop);
+ }
+ #endif /* CONFIG_X86_32 || CONFIG_COMPAT */
++
++/*
++ * Assembly template for the RSEQ guarded robust lock functions. The basic
++ * functionality is:
++ *
++ *		mov{q,l}	$0, (pending_ptr)	Disarm the pending op
++ * .Lcs_start:					Start of the critical section
++ *		cmp{q,l}	$0, 8(rseq)	In an RSEQ critical section?
++ *		jz		.Lfail		No: fail
++ *		mov{q,l}	pending, (pending_ptr)	Arm the pending op
++ *		lock cmpxchgl	set, (lock)	Try the expect -> set transition
++ *		jz		.Lsuccess	Acquired: leave pending op armed
++ * .Lcs_abort:					Abort/failure landing pad
++ *		mov{q,l}	$0, (pending_ptr)	Disarm the pending op
++ * .Lcs_end:					End of the critical section
++ * .Lfail:
++ *		return 0
++ * .Lsuccess:
++ *		return 1
++ *
++ * The caller reserves an owner identifier (cookie) for the lock word and
++ * stores TLS::rseq::rseq_cs before invoking this function. Any RSEQ event
++ * (preemption, signal delivery, or an RSEQ IPI from membarrier()) between
++ * the store to rseq_cs and the cmpxchg invalidates the reservation:
++ *
++ *  - An event before .Lcs_start clears rseq_cs, so the check fails.
++ *
++ *  - For an event with the instruction pointer inside
++ *    [.Lcs_start, .Lcs_end) the kernel consults the Zero Flag. ZF == 0
++ *    means the cmpxchg has not (successfully) executed: the kernel clears
++ *    the pending op pointer and moves the instruction pointer to
++ *    .Lcs_abort, which makes the function return 0. The ZF invariant
++ *    holds because a passed rseq_cs check leaves ZF == 0 and MOV does not
++ *    modify flags. ZF == 1 means either the rseq_cs check just failed
++ *    (about to branch to .Lfail with the pending op disarmed) or the
++ *    cmpxchg succeeded and the operation is committed; in both cases no
++ *    fixup is required.
++ *
++ * On success the pending op stays armed with the just written cookie
++ * until the caller has queued the lock in the robust list, mirroring the
++ * list_op_pending protocol of the original robust list.
++ *
++ * The pending op pointer is always in DX, independent of the build mode,
++ * so the kernel side pointer retrieval is uniform. The pointer size is
++ * stored in the matching critical section range struct.
++ *
++ * As with the try_unlock functions there are two entry points to handle
++ * the different robust list pending op pointer sizes.
++ */
++#define CLEAR_PENDQ	"movq	$0, %a[pptr]\n"
++#define CLEAR_PENDL	"movl	$0, %a[pptr]\n"
++#define ARM_PENDQ	"movq	%[pend],  %a[pptr]\n"
++#define ARM_PENDL	"movl	%k[pend], %a[pptr]\n"
++
++/*
++ * struct rseq::rseq_cs is at offset 8. This is statically asserted in
++ * arch/x86/entry/vdso/vma.c. A 32-bit task's rseq_cs value is a 32-bit
++ * pointer stored as u64, so testing the low 32 bits is sufficient in the
++ * 32-bit VDSO.
++ */
++#ifdef __x86_64__
++#define CMP_RSEQ_CS	"cmpq	$0, 8(%[rseq])\n"
++#else
++#define CMP_RSEQ_CS	"cmpl	$0, 8(%[rseq])\n"
++#endif
++
++#define futex_robust_cmpxchg_rseq(prefix, clear_pend, arm_pend,		\
++				  __pptr, __pend, __lock, __val, __set, __rseq) \
++({									\
++	asm volatile (							\
++		"						\n"	\
++			clear_pend					\
++		"						\n"	\
++		LABEL2(prefix, start)					\
++		"						\n"	\
++			CMP_RSEQ_CS					\
++		"	jz	2f				\n"	\
++		"						\n"	\
++			arm_pend					\
++		"						\n"	\
++		"	lock cmpxchgl	%[set], %a[lock]	\n"	\
++		"	jz	1f				\n"	\
++		"						\n"	\
++		LABEL2(prefix, abort)					\
++		"						\n"	\
++			clear_pend					\
++		"						\n"	\
++		LABEL2(prefix, end)					\
++		"2:	xorl	%k[val], %k[val]		\n"	\
++		"	jmp	3f				\n"	\
++		"1:	movl	$1, %k[val]			\n"	\
++		"3:						\n"	\
++		: [val]   "+&a" (__val)					\
++		: [pptr]  "d"   (__pptr),				\
++		  [pend]  "r"   (__pend),				\
++		  [lock]  "r"   (__lock),				\
++		  [set]   "r"   (__set),				\
++		  [rseq]  "r"   (__rseq)				\
++		: "memory", "cc"					\
++	);								\
++	__val;								\
++})
++
++#ifdef __x86_64__
++__u32 __vdso_futex_robust_list64_cmpxchg_rseq(__u64 *pending_ptr, __u64 pending,
++					      __u32 *lock, __u32 expect, __u32 set,
++					      const void *rseq)
++{
++	return futex_robust_cmpxchg_rseq(__futex_list64_cmpxchg_rseq_cs,
++					 CLEAR_PENDQ, ARM_PENDQ,
++					 pending_ptr, pending, lock, expect, set, rseq);
++}
++#endif /* __x86_64__ */
++
++#if defined(CONFIG_X86_32) || defined(CONFIG_COMPAT)
++__u32 __vdso_futex_robust_list32_cmpxchg_rseq(__u32 *pending_ptr, __u32 pending,
++					      __u32 *lock, __u32 expect, __u32 set,
++					      const void *rseq)
++{
++	return futex_robust_cmpxchg_rseq(__futex_list32_cmpxchg_rseq_cs,
++					 CLEAR_PENDL, ARM_PENDL,
++					 pending_ptr, (unsigned long)pending,
++					 lock, expect, set, rseq);
++}
++#endif /* CONFIG_X86_32 || CONFIG_COMPAT */
+diff --git a/arch/x86/entry/vdso/vdso32/vdso32.lds.S b/arch/x86/entry/vdso/vdso32/vdso32.lds.S
+index cee8f7f9fe80..1fd92305e21c 100644
+--- a/arch/x86/entry/vdso/vdso32/vdso32.lds.S
++++ b/arch/x86/entry/vdso/vdso32/vdso32.lds.S
+@@ -32,6 +32,7 @@ VERSION
+ 		__vdso_getcpu;
+ #ifdef CONFIG_FUTEX_ROBUST_UNLOCK
+ 		__vdso_futex_robust_list32_try_unlock;
++		__vdso_futex_robust_list32_cmpxchg_rseq;
+ #endif
+ 	};
+ 
+diff --git a/arch/x86/entry/vdso/vdso64/vdso64.lds.S b/arch/x86/entry/vdso/vdso64/vdso64.lds.S
+index 4a72122da81b..7a7c62c2e0d4 100644
+--- a/arch/x86/entry/vdso/vdso64/vdso64.lds.S
++++ b/arch/x86/entry/vdso/vdso64/vdso64.lds.S
+@@ -35,8 +35,10 @@ VERSION {
+ 
+ #ifdef CONFIG_FUTEX_ROBUST_UNLOCK
+ 		__vdso_futex_robust_list64_try_unlock;
++		__vdso_futex_robust_list64_cmpxchg_rseq;
+ #ifdef CONFIG_COMPAT
+ 		__vdso_futex_robust_list32_try_unlock;
++		__vdso_futex_robust_list32_cmpxchg_rseq;
+ #endif
+ #endif
+ 	local: *;
+diff --git a/arch/x86/entry/vdso/vdso64/vdsox32.lds.S b/arch/x86/entry/vdso/vdso64/vdsox32.lds.S
+index b917dc69f62f..b287d6f32f67 100644
+--- a/arch/x86/entry/vdso/vdso64/vdsox32.lds.S
++++ b/arch/x86/entry/vdso/vdso64/vdsox32.lds.S
+@@ -25,8 +25,10 @@ VERSION {
+ 
+ #ifdef CONFIG_FUTEX_ROBUST_UNLOCK
+ 		__vdso_futex_robust_list64_try_unlock;
++		__vdso_futex_robust_list64_cmpxchg_rseq;
+ #ifdef CONFIG_COMPAT
+ 		__vdso_futex_robust_list32_try_unlock;
++		__vdso_futex_robust_list32_cmpxchg_rseq;
+ #endif
+ #endif
+ 	local: *;
+diff --git a/arch/x86/entry/vdso/vma.c b/arch/x86/entry/vdso/vma.c
+index 18dfd80a81ef..1df69985344b 100644
+--- a/arch/x86/entry/vdso/vma.c
++++ b/arch/x86/entry/vdso/vma.c
+@@ -7,6 +7,7 @@
+ #include <linux/mm.h>
+ #include <linux/err.h>
+ #include <linux/futex.h>
++#include <linux/rseq.h>
+ #include <linux/sched.h>
+ #include <linux/sched/task_stack.h>
+ #include <linux/slab.h>
+@@ -75,6 +76,9 @@ static void vdso_fix_landing(const struct vdso_image *image,
+ }
+ 
+ #ifdef CONFIG_FUTEX_ROBUST_UNLOCK
++/* The VDSO code relies on the location of the rseq_cs member */
++static_assert(offsetof(struct rseq, rseq_cs) == 8);
++
+ static void vdso_futex_robust_unlock_update_ips(void)
+ {
+ 	const struct vdso_image *image = current->mm->context.vdso_image;
+@@ -87,12 +91,20 @@ static void vdso_futex_robust_unlock_update_ips(void)
+ #ifdef CONFIG_X86_64
+ 	futex_set_vdso_cs_range(fd, idx, vdso + image->sym___futex_list64_try_unlock_cs_start,
+ 				vdso + image->sym___futex_list64_try_unlock_cs_end, false);
++	futex_set_vdso_cmpxchg_cs_range(fd, idx,
++				vdso + image->sym___futex_list64_cmpxchg_rseq_cs_start,
++				vdso + image->sym___futex_list64_cmpxchg_rseq_cs_abort,
++				vdso + image->sym___futex_list64_cmpxchg_rseq_cs_end, false);
+ 	idx++;
+ #endif /* CONFIG_X86_64 */
+ 
+ #if defined(CONFIG_X86_32) || defined(CONFIG_COMPAT)
+ 	futex_set_vdso_cs_range(fd, idx, vdso + image->sym___futex_list32_try_unlock_cs_start,
+ 				vdso + image->sym___futex_list32_try_unlock_cs_end, true);
++	futex_set_vdso_cmpxchg_cs_range(fd, idx,
++				vdso + image->sym___futex_list32_cmpxchg_rseq_cs_start,
++				vdso + image->sym___futex_list32_cmpxchg_rseq_cs_abort,
++				vdso + image->sym___futex_list32_cmpxchg_rseq_cs_end, true);
+ #endif /* CONFIG_X86_32 || CONFIG_COMPAT */
+ }
+ #else
+diff --git a/arch/x86/include/asm/futex_robust.h b/arch/x86/include/asm/futex_robust.h
+index e87954703ae2..ff3f7aac2d2a 100644
+--- a/arch/x86/include/asm/futex_robust.h
++++ b/arch/x86/include/asm/futex_robust.h
+@@ -16,4 +16,19 @@ static __always_inline void __user *x86_futex_robust_unlock_get_pop(struct pt_re
+ #define arch_futex_robust_unlock_get_pop(regs)	\
+ 	x86_futex_robust_unlock_get_pop(regs)
+ 
++static __always_inline void __user *x86_futex_robust_cmpxchg_get_pending(struct pt_regs *regs)
++{
++	/*
++	 * If ZF is clear then the cmpxchg has not (successfully) executed
++	 * and the operation must be aborted: the pending op pointer needs
++	 * to be cleared. If ZF is set the operation either committed or is
++	 * about to take the failure path with the pending op disarmed, so
++	 * nothing to do.
++	 */
++	return regs->flags & X86_EFLAGS_ZF ? NULL : (void __user *)regs->dx;
++}
++
++#define arch_futex_robust_cmpxchg_get_pending(regs)	\
++	x86_futex_robust_cmpxchg_get_pending(regs)
++
+ #endif /* _ASM_X86_FUTEX_ROBUST_H */
+diff --git a/arch/x86/include/asm/vdso.h b/arch/x86/include/asm/vdso.h
+index 4e735158c1b2..4d26a722710a 100644
+--- a/arch/x86/include/asm/vdso.h
++++ b/arch/x86/include/asm/vdso.h
+@@ -28,6 +28,12 @@ struct vdso_image {
+ 	long sym___futex_list64_try_unlock_cs_end;
+ 	long sym___futex_list32_try_unlock_cs_start;
+ 	long sym___futex_list32_try_unlock_cs_end;
++	long sym___futex_list64_cmpxchg_rseq_cs_start;
++	long sym___futex_list64_cmpxchg_rseq_cs_abort;
++	long sym___futex_list64_cmpxchg_rseq_cs_end;
++	long sym___futex_list32_cmpxchg_rseq_cs_start;
++	long sym___futex_list32_cmpxchg_rseq_cs_abort;
++	long sym___futex_list32_cmpxchg_rseq_cs_end;
+ };
+ 
+ extern const struct vdso_image vdso64_image;
+diff --git a/arch/x86/tools/vdso2c.c b/arch/x86/tools/vdso2c.c
+index 64a636b9fc37..b0502439ffaf 100644
+--- a/arch/x86/tools/vdso2c.c
++++ b/arch/x86/tools/vdso2c.c
+@@ -85,6 +85,12 @@ struct vdso_sym required_syms[] = {
+ 	{"__futex_list64_try_unlock_cs_end",		true},
+ 	{"__futex_list32_try_unlock_cs_start",		true},
+ 	{"__futex_list32_try_unlock_cs_end",		true},
++	{"__futex_list64_cmpxchg_rseq_cs_start",	true},
++	{"__futex_list64_cmpxchg_rseq_cs_abort",	true},
++	{"__futex_list64_cmpxchg_rseq_cs_end",		true},
++	{"__futex_list32_cmpxchg_rseq_cs_start",	true},
++	{"__futex_list32_cmpxchg_rseq_cs_abort",	true},
++	{"__futex_list32_cmpxchg_rseq_cs_end",		true},
+ };
+ 
+ __attribute__((format(printf, 1, 2))) __attribute__((noreturn))
+diff --git a/include/linux/futex.h b/include/linux/futex.h
+index 51f4ccdc9092..670eca492027 100644
+--- a/include/linux/futex.h
++++ b/include/linux/futex.h
+@@ -109,6 +109,7 @@ static inline int futex_hash_free(struct mm_struct *mm) { return 0; }
+ 
+ void futex_reset_cs_ranges(struct futex_mm_data *fd);
+ void __futex_fixup_robust_unlock(struct pt_regs *regs, struct futex_unlock_cs_range *csr);
++void futex_fixup_robust_cmpxchg(struct pt_regs *regs);
+ 
+ static inline bool futex_within_robust_unlock(struct pt_regs *regs,
+ 					      struct futex_unlock_cs_range *csr)
+@@ -148,6 +149,16 @@ static inline void futex_set_vdso_cs_range(struct futex_mm_data *fd, unsigned in
+ 	fd->unlock.cs_ranges[idx].len = end - start;
+ 	fd->unlock.cs_ranges[idx].pop_size32 = sz32;
+ }
++
++static inline void futex_set_vdso_cmpxchg_cs_range(struct futex_mm_data *fd, unsigned int idx,
++						   unsigned long start, unsigned long abort,
++						   unsigned long end, bool sz32)
++{
++	fd->unlock.cmpxchg_ranges[idx].start_ip = start;
++	fd->unlock.cmpxchg_ranges[idx].abort_ip = abort;
++	fd->unlock.cmpxchg_ranges[idx].len = end - start;
++	fd->unlock.cmpxchg_ranges[idx].pop_size32 = sz32;
++}
+ #else /* CONFIG_FUTEX_ROBUST_UNLOCK */
+ static inline void futex_fixup_robust_unlock(struct pt_regs *regs) { }
+ #endif /* !CONFIG_FUTEX_ROBUST_UNLOCK */
+diff --git a/include/linux/futex_types.h b/include/linux/futex_types.h
+index d9835ddbafb0..8d4ceb77cb3a 100644
+--- a/include/linux/futex_types.h
++++ b/include/linux/futex_types.h
+@@ -76,12 +76,28 @@ struct futex_unlock_cs_range {
+ 
+ #define FUTEX_ROBUST_MAX_CS_RANGES	(1 + IS_ENABLED(CONFIG_COMPAT))
+ 
++/**
++ * struct futex_cmpxchg_cs_range - Range for the VDSO RSEQ guarded cmpxchg
++ * @start_ip:	The start IP of the critical section (inclusive)
++ * @abort_ip:	The IP execution is moved to when the section is aborted
++ * @len:	The length of the critical section
++ * @pop_size32:	Pending OP pointer size indicator. 0 == 64-bit, 1 == 32-bit
++ */
++struct futex_cmpxchg_cs_range {
++	unsigned long	       start_ip;
++	unsigned long	       abort_ip;
++	unsigned int	       len;
++	unsigned int	       pop_size32;
++};
++
+ /**
+  * struct futex_unlock_cs_ranges - Futex unlock VSDO critical sections
+- * @cs_ranges:	Array of critical section ranges
++ * @cs_ranges:		Array of critical section ranges
++ * @cmpxchg_ranges:	Array of RSEQ guarded cmpxchg critical section ranges
+  */
+ struct futex_unlock_cs_ranges {
+ 	struct futex_unlock_cs_range	cs_ranges[FUTEX_ROBUST_MAX_CS_RANGES];
++	struct futex_cmpxchg_cs_range	cmpxchg_ranges[FUTEX_ROBUST_MAX_CS_RANGES];
+ };
+ #else  /* CONFIG_FUTEX_ROBUST_UNLOCK */
+ struct futex_unlock_cs_ranges { };
+diff --git a/include/linux/rseq_entry.h b/include/linux/rseq_entry.h
+index ed9da6e41a2a..27483c0c2e43 100644
+--- a/include/linux/rseq_entry.h
++++ b/include/linux/rseq_entry.h
+@@ -249,6 +249,12 @@ static __always_inline bool rseq_grant_slice_extension(unsigned long ti_work, un
+ 
+ bool rseq_debug_update_user_cs(struct task_struct *t, struct pt_regs *regs, unsigned long csaddr);
+ 
++#ifdef CONFIG_FUTEX_ROBUST_UNLOCK
++void futex_fixup_robust_cmpxchg(struct pt_regs *regs);
++#else
++static inline void futex_fixup_robust_cmpxchg(struct pt_regs *regs) { }
++#endif
++
+ static __always_inline void rseq_note_user_irq_entry(void)
+ {
+ 	if (IS_ENABLED(CONFIG_GENERIC_IRQ_ENTRY))
+@@ -358,8 +364,17 @@ bool rseq_debug_update_user_cs(struct task_struct *t, struct pt_regs *regs,
+ 		abort_ip = 0ULL;
+ 	}
+ 
+-	if (unlikely(abort_ip))
++	if (unlikely(abort_ip)) {
+ 		rseq_trace_ip_fixup(ip, start_ip, offset, abort_ip);
++	} else {
++		/*
++		 * The critical section was cleared because the instruction
++		 * pointer is outside of the descriptor range. If the task
++		 * is inside the VDSO robust cmpxchg critical section, that
++		 * has to be aborted as well. See rseq_update_user_cs().
++		 */
++		futex_fixup_robust_cmpxchg(regs);
++	}
+ 	return true;
+ die:
+ 	t->rseq.event.fatal = true;
+@@ -444,8 +459,21 @@ rseq_update_user_cs(struct task_struct *t, struct pt_regs *regs, unsigned long c
+ 		abort_ip = 0ULL;
+ 	}
+ 
+-	if (unlikely(abort_ip))
++	if (unlikely(abort_ip)) {
+ 		rseq_trace_ip_fixup(ip, start_ip, offset, abort_ip);
++	} else {
++		/*
++		 * The critical section was cleared because the instruction
++		 * pointer is outside of the descriptor range. If the task is
++		 * inside the VDSO robust cmpxchg critical section, that has
++		 * to be aborted as well, so that a lock operation whose
++		 * reservation became stale due to this RSEQ event cannot
++		 * publish the reservation into the lock word anymore. The
++		 * fixup disarms the robust list pending op and moves the
++		 * task to the abort IP of the VDSO function.
++		 */
++		futex_fixup_robust_cmpxchg(regs);
++	}
+ 	return true;
+ die:
+ 	t->rseq.event.fatal = true;
+diff --git a/include/vdso/futex.h b/include/vdso/futex.h
+index 3cd175eefe64..2796bcf42a27 100644
+--- a/include/vdso/futex.h
++++ b/include/vdso/futex.h
+@@ -49,4 +49,87 @@ __u32 __vdso_futex_robust_list64_try_unlock(__u32 *lock, __u32 tid, __u64 *pop);
+  */
+ __u32 __vdso_futex_robust_list32_try_unlock(__u32 *lock, __u32 tid, __u32 *pop);
+ 
++/**
++ * __vdso_futex_robust_list64_cmpxchg_rseq - Try to lock a robust futex with a
++ *					     reserved owner identifier under
++ *					     RSEQ protection
++ * @pending_ptr:	Pointer to the task's robust_list_head::list_op_pending
++ * @pending:		The value to arm *@pending_ptr with, i.e. the address
++ *			of the robust list entry of the lock (including
++ *			modifier bits)
++ * @lock:		Pointer to the futex lock object
++ * @expect:		The expected lock value (usually 0 == unlocked)
++ * @set:		The value to store on success: the owner identifier
++ *			(cookie) which the caller reserved for this lock
++ *			operation
++ * @rseq:		Pointer to the task's registered struct rseq TLS area
++ *
++ * Return: 1 if the lock was acquired, 0 otherwise.
++ *
++ * The function implements:
++ *
++ *	*pending_ptr = NULL;
++ *	if (!rseq->rseq_cs)
++ *		return 0;
++ *	*pending_ptr = pending;
++ *	if (!atomic_try_cmpxchg(lock, &expect, set))
++ *		*pending_ptr = NULL;
++ *		return 0;
++ *	}
++ *	return 1;
++ *
++ * with the following guarantees:
++ *
++ *  - The region between the rseq_cs check and the cmpxchg is atomic
++ *    versus RSEQ events (preemption, signal delivery, RSEQ IPIs): if such
++ *    an event invalidates the caller's owner identifier reservation, the
++ *    cmpxchg does not execute, the pending op is disarmed and the
++ *    function returns 0.
++ *
++ *  - Disarming the pending op after a failed cmpxchg is atomic versus
++ *    signal delivery, the same way as in the try_unlock functions above.
++ *
++ * The caller is expected to:
++ *
++ *  1) Store the address of a valid struct rseq_cs descriptor, whose IP
++ *     range does not contain any of the subsequently executed code, in
++ *     rseq->rseq_cs. This turns rseq_cs into an "event since this store"
++ *     detector: any RSEQ event clears it. The caller must not issue any
++ *     system call between this store and the return of this function. A
++ *     task which voluntarily blocks in a system call does not necessarily
++ *     receive an RSEQ event on resumption, so rseq_cs would not act as a
++ *     reservation invalidation detector across such a call.
++ *
++ *  2) Reserve an owner identifier for the lock word (e.g. via an atomic
++ *     counter increment) and store it in the cookie field of the robust
++ *     list entry.
++ *
++ *  3) Invoke this function.
++ *
++ *  4) Clear rseq->rseq_cs. On success, queue the entry in the robust
++ *     list and disarm the pending op. On failure, handle contention and
++ *     retry with a fresh reservation.
++ *
++ * On success the pending op stays armed, with the lock word holding the
++ * cookie which is also reachable for the kernel through the pending
++ * entry, until the caller disarms it in step 4, mirroring the
++ * list_op_pending protocol of the original robust list.
++ */
++__u32 __vdso_futex_robust_list64_cmpxchg_rseq(__u64 *pending_ptr, __u64 pending,
++					      __u32 *lock, __u32 expect, __u32 set,
++					      const void *rseq);
++
++/**
++ * __vdso_futex_robust_list32_cmpxchg_rseq - Try to lock a robust futex with a
++ *					     reserved owner identifier under
++ *					     RSEQ protection, with a 32-bit
++ *					     pending op pointer
++ *
++ * Same as __vdso_futex_robust_list64_cmpxchg_rseq() just with a 32-bit
++ * @pending_ptr pointer and @pending value.
++ */
++__u32 __vdso_futex_robust_list32_cmpxchg_rseq(__u32 *pending_ptr, __u32 pending,
++					      __u32 *lock, __u32 expect, __u32 set,
++					      const void *rseq);
++
+ #endif
+diff --git a/kernel/futex/core.c b/kernel/futex/core.c
+index bd50e5969131..bd3b0b36d286 100644
+--- a/kernel/futex/core.c
++++ b/kernel/futex/core.c
+@@ -1485,11 +1485,121 @@ void __futex_fixup_robust_unlock(struct pt_regs *regs, struct futex_unlock_cs_ra
+ 	futex_robust_list_clear_pending(pop, csr->pop_size32 ? FLAGS_ROBUST_LIST32 : 0);
+ }
+ 
+-#endif /* CONFIG_FUTEX_ROBUST_UNLOCK */
++static void __futex_fixup_robust_cmpxchg(struct pt_regs *regs,
++					 struct futex_cmpxchg_cs_range *csr)
++{
++	/*
++	 * arch_futex_robust_cmpxchg_get_pending() returns the list pending
++	 * op pointer from @regs if the operation has not yet committed,
++	 * i.e. the cmpxchg has not successfully executed. If it committed
++	 * there is nothing to fix up.
++	 */
++	void __user *pop = arch_futex_robust_cmpxchg_get_pending(regs);
++
++	if (!pop)
++		return;
++
++	/*
++	 * Disarm the pending op and move the task to the abort IP, which
++	 * makes the VDSO function return failure. The abort code disarms
++	 * the pending op again, which makes this safe against an
++	 * unresolvable fault of the user access here:
++	 *
++	 *  - If this is a fixup for an interrupt induced RSEQ event, the
++	 *    task resumes at the abort IP and the store either succeeds or
++	 *    the task gets a signal delivered.
++	 *
++	 *  - If this is a fixup prior to signal delivery, the write to the
++	 *    user address is only required to protect against a signal
++	 *    handler which does not return to the interrupted context. In
++	 *    that case the handler stack frame setup will fail for the
++	 *    same reason and the task is terminated by SIGSEGV, which
++	 *    makes the robust exit cleanup process the still armed pending
++	 *    op correctly.
++	 */
++	if (csr->pop_size32)
++		put_user(0U, (u32 __user *)pop);
++	else
++		put_user(0UL, (unsigned long __user *)pop);
++
++	instruction_pointer_set(regs, csr->abort_ip);
++}
++
++/**
++ * futex_fixup_robust_cmpxchg - Handle RSEQ events with the IP inside the
++ *				VDSO robust cmpxchg critical section
++ * @regs:	Pointer to the current exit to user mode pt_regs
++ *
++ * Invoked when an RSEQ event resulted in clearing TLS::rseq::rseq_cs
++ * because the instruction pointer is outside of the user space critical
++ * section descriptor range. If the instruction pointer is inside the VDSO
++ * robust cmpxchg critical section and the operation has not committed,
++ * the pending op is disarmed and the task resumes at the abort IP.
++ */
++void futex_fixup_robust_cmpxchg(struct pt_regs *regs)
++{
++	struct futex_cmpxchg_cs_range *csr = current->mm->futex.unlock.cmpxchg_ranges;
++	unsigned long ip = instruction_pointer(regs);
++
++	/* The loop is optimized out for !COMPAT */
++	for (int r = 0; r < FUTEX_ROBUST_MAX_CS_RANGES; r++, csr++) {
++		if (unlikely(ip - csr->start_ip < csr->len)) {
++			__futex_fixup_robust_cmpxchg(regs, csr);
++			return;
++		}
++	}
++}
++
++/*
++ * A task which is killed by an unhandled fatal signal never returns to
++ * user space: get_signal() invokes do_exit() directly and neither the
++ * RSEQ critical section handling nor the signal delivery fixup runs. If
++ * such a task dies with the instruction pointer inside one of the VDSO
++ * critical sections, its armed list_op_pending may no longer be a valid
++ * attribution source for the robust list exit walk below:
++ *
++ *  1) Inside the cmpxchg section, before the cmpxchg committed: the
++ *     cookie reservation was never validated and can be stale.
++ *
++ *  2) Inside the try_unlock section, after the unlock committed but
++ *     before the pending op was disarmed: the lock was released and can
++ *     have been legitimately re-acquired before the exit walk runs.
++ *
++ * In both cases, with counter based cookies, the stale pending cookie
++ * can numerically match the (wrapped) cookie of the current live owner
++ * of the lock, so processing the pending op would misattribute the lock
++ * to the dead task and corrupt it. TID based and unique cookie setups
++ * are immune, as an identifier cannot be reused before the exit cleanup
++ * of its previous holder has run, but for counter cookies these fixups
++ * are required for correctness, not just hygiene.
++ *
++ * Apply the same fixups which signal delivery would have applied,
++ * against the task's user register frame: disarm the pending op if and
++ * only if the interrupted operation makes it invalid (cmpxchg section
++ * with ZF clear, try_unlock section with ZF set). In all other cases the
++ * pending op is perfectly valid and processing it is required.
++ */
++static void futex_cleanup_fixup_pending(struct task_struct *tsk)
++{
++	struct pt_regs *regs = task_pt_regs(tsk);
++	struct futex_unlock_cs_range *csr = tsk->mm->futex.unlock.cs_ranges;
++
++	for (int r = 0; r < FUTEX_ROBUST_MAX_CS_RANGES; r++, csr++) {
++		if (unlikely(futex_within_robust_unlock(regs, csr))) {
++			__futex_fixup_robust_unlock(regs, csr);
++			return;
++		}
++	}
++	futex_fixup_robust_cmpxchg(regs);
++}
++#else /* CONFIG_FUTEX_ROBUST_UNLOCK */
++static inline void futex_cleanup_fixup_pending(struct task_struct *tsk) { }
++#endif /* !CONFIG_FUTEX_ROBUST_UNLOCK */
+ 
+ static void futex_cleanup(struct task_struct *tsk)
+ {
+ 	if (unlikely(tsk->futex.robust_list)) {
++		futex_cleanup_fixup_pending(tsk);
+ 		exit_robust_list(tsk);
+ 		tsk->futex.robust_list = NULL;
+ 		tsk->futex.robust_list_flags = 0;
+@@ -1497,6 +1607,7 @@ static void futex_cleanup(struct task_struct *tsk)
+ 
+ #ifdef CONFIG_COMPAT
+ 	if (unlikely(tsk->futex.compat_robust_list)) {
++		futex_cleanup_fixup_pending(tsk);
+ 		compat_exit_robust_list(tsk);
+ 		tsk->futex.compat_robust_list = NULL;
+ 		tsk->futex.compat_robust_list_flags = 0;
+@@ -2023,13 +2134,15 @@ static void futex_invalidate_cs_ranges(struct futex_mm_data *fd)
+ 	 * tasks as they use VDSO32 which does not provide the 64-bit pointer
+ 	 * variant.
+ 	 */
+-	for (int i = 0; i < FUTEX_ROBUST_MAX_CS_RANGES; i++)
++	for (int i = 0; i < FUTEX_ROBUST_MAX_CS_RANGES; i++) {
+ 		fd->unlock.cs_ranges[i].start_ip = ~0UL;
++		fd->unlock.cmpxchg_ranges[i].start_ip = ~0UL;
++	}
+ }
+ 
+ void futex_reset_cs_ranges(struct futex_mm_data *fd)
+ {
+-	memset(fd->unlock.cs_ranges, 0, sizeof(fd->unlock.cs_ranges));
++	memset(&fd->unlock, 0, sizeof(fd->unlock));
+ 	futex_invalidate_cs_ranges(fd);
+ }
+ 
+-- 
+2.54.0
+

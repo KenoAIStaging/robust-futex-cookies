@@ -1,0 +1,134 @@
+From 378b31935b99bfe5f697cfb9c570e172ea8b4a7e Mon Sep 17 00:00:00 2001
+From: Keno Fischer <keno@juliahub.com>
+Date: Thu, 16 Jul 2026 08:28:45 +0000
+Subject: [PATCH 0/6] futex: PID namespace agnostic robust futexes via owner cookies
+
+Robust futexes identify the lock owner by storing the owner's TID in the
+futex word and comparing it against the exiting task's TID during the
+robust list exit walk. TIDs are only unique within a PID namespace, so
+this identification is ambiguous for futexes in memory shared across PID
+namespaces: a task dying in one namespace can be misidentified as the
+owner of a lock legitimately held by a live task in another namespace,
+which corrupts the lock word (FUTEX_OWNER_DIED gets set, the owner field
+cleared, a waiter woken) and breaks mutual exclusion. This has been a
+known limitation of robust futexes ever since PID namespaces were
+introduced.
+
+This series makes the owner identifier user space policy:
+
+Patch 1 extends sys_set_robust_list() with an extensible list head
+(struct robust_list_head2, selected by size, carrying a validated flags
+word). With ROBUST_LIST_COOKIE set, the exit walk compares the futex
+word against a user space managed 32-bit cookie instead of the TID: for
+queued entries a cookie stored at cookie_offset relative to the entry
+(written only by the lock owner), for the pending operation the task
+private list_op_pending_cookie. This alone suffices for robust mutexes
+whose users can assign unique cookies out of band, e.g. via allocation
+tables in the shared memory itself or via OFD file locks, both of which
+release the identifier no earlier than the holder's exit cleanup.
+
+For POSIX style process shared mutexes, which have no natural home for
+an allocation protocol, a per lock reservation counter can provide the
+cookies: every lock attempt draws a fresh 30-bit value. Finite counters
+wrap, so the protocol must guarantee that a stale reservation (drawn a
+full counter period ago) can never be published into the lock word, and
+that a dead task's robust list state is never interpreted against a
+lock whose (wrapped) cookie happens to match numerically. Patches 3-5
+provide the required kernel assists:
+
+Patch 3 adds __vdso_futex_robust_list{64,32}_cmpxchg_rseq(): the lock
+side counterpart of __vdso_futex_robust_list{64,32}_try_unlock(). It
+validates that TLS::rseq::rseq_cs is still armed (the caller arms it
+before drawing the reservation, so any RSEQ event in between
+invalidates the attempt), arms list_op_pending and performs the
+cmpxchg. The window between the check and the cmpxchg is made atomic
+against RSEQ events by a kernel fixup, and the pending op disarm on
+failure is atomic against signal delivery like in the try_unlock
+functions. The patch also adds exit time fixups which disarm a pending
+op that a fatal-signal death left behind in a state where processing it
+would be invalid (uncommitted lock attempt, completed unlock). Both
+exit time fixup windows were found by model checking, see below.
+
+Patch 5 adds MEMBARRIER_CMD_SHARED_EXPEDITED_RSEQ, an RSEQ fence
+covering every process which has a shared writable mapping of the page
+containing a given address and has registered with the accompanying
+registration command. This is the quiescence operation executed on
+counter epoch changes: it guarantees that no reservation drawn before
+the epoch change can pass the rseq_cs validation afterwards. The
+address is passed via a new fourth syscall argument, following the
+precedent of the cpu_id argument added in 2a36ab717e8f
+("rseq/membarrier: Add MEMBARRIER_CMD_PRIVATE_EXPEDITED_RSEQ").
+
+Patches 2, 4 and 6 add selftests, including a reproducer of the
+original cross-namespace corruption (two processes in different PID
+namespaces observing the same namespace local TID) which demonstrates
+that the cookie variant leaves the foreign-owned lock alone.
+
+The protocols were modeled in TLA+ (explicit cookie assignment and the
+full counter/reservation/fence protocol, including death at arbitrary
+points, delayed exit cleanup and counter wraparound with a miniature
+cookie space). TLC validates the final design (safety and lock recovery
+liveness) and demonstrably has teeth: it finds the classic TID
+collision corruption, the corruption resulting from attributing the
+pending op through the shared entry cookie (which is why
+list_op_pending_cookie exists), the robustness loss of that variant
+even with exit fixups in place, and the two exit time fixup windows of
+patch 3 - one of which (death between a committed vdso unlock and the
+pending op disarm, processed after the lock was re-acquired under a
+wrapped cookie) was a genuine model checker counterexample against a
+design believed correct at the time. Reference user space
+implementations of all three cookie assignment schemes, benchmarks
+against pthread mutexes and the TLA+ specifications are available and
+can be posted alongside if desired.
+
+All patches survive the futex and membarrier selftests plus
+multi-process / cross PID namespace kill stress tests of the reference
+mutex implementations under QEMU. Patch 1 builds and works standalone
+for bisectability.
+
+Note on checkpatch: the remaining errors are parser artifacts (an asm
+label colon inside a stringified macro, matching the existing LABEL()
+macro in vfutex.c, and _Atomic()/function pointer declarations in the
+selftests, matching the existing code in robust_list.c).
+
+Keno Fischer (6):
+  futex: Add ROBUST_LIST_COOKIE for PID namespace agnostic robust lists
+  selftests/futex: Add robust list cookie tests
+  futex/vdso: Implement __vdso_futex_robust_list{64,32}_cmpxchg_rseq()
+  selftests/futex: Add tests for the VDSO robust cmpxchg RSEQ operations
+  sched/membarrier: Add MEMBARRIER_CMD_SHARED_EXPEDITED_RSEQ
+  selftests/membarrier: Add tests for
+    MEMBARRIER_CMD_SHARED_EXPEDITED_RSEQ
+
+ Documentation/locking/robust-futex-ABI.rst    |  59 ++
+ arch/x86/entry/vdso/common/vfutex.c           | 126 +++
+ arch/x86/entry/vdso/vdso32/vdso32.lds.S       |   1 +
+ arch/x86/entry/vdso/vdso64/vdso64.lds.S       |   2 +
+ arch/x86/entry/vdso/vdso64/vdsox32.lds.S      |   2 +
+ arch/x86/entry/vdso/vma.c                     |  12 +
+ arch/x86/include/asm/futex_robust.h           |  15 +
+ arch/x86/include/asm/vdso.h                   |   6 +
+ arch/x86/tools/vdso2c.c                       |   6 +
+ include/linux/compat.h                        |   8 +
+ include/linux/futex.h                         |  11 +
+ include/linux/futex_types.h                   |  24 +-
+ include/linux/rseq_entry.h                    |  32 +-
+ include/linux/sched/mm.h                      |   2 +
+ include/linux/syscalls.h                      |   3 +-
+ include/uapi/linux/futex.h                    |  58 ++
+ include/uapi/linux/membarrier.h               |  34 +
+ include/vdso/futex.h                          |  83 ++
+ kernel/futex/core.c                           | 205 ++++-
+ kernel/futex/futex.h                          |   9 +
+ kernel/futex/syscalls.c                       |  66 +-
+ kernel/sched/membarrier.c                     | 204 ++++-
+ .../selftests/futex/functional/robust_list.c  | 731 +++++++++++++++++-
+ tools/testing/selftests/membarrier/.gitignore |   1 +
+ tools/testing/selftests/membarrier/Makefile   |   3 +-
+ .../membarrier/membarrier_shared_rseq_test.c  | 335 ++++++++
+ 26 files changed, 2002 insertions(+), 36 deletions(-)
+ create mode 100644 tools/testing/selftests/membarrier/membarrier_shared_rseq_test.c
+
+-- 
+2.54.0
+
