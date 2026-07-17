@@ -13,7 +13,10 @@ after the 7.2 `FUTEX_ROBUST_UNLOCK`/vDSO robust-unlock work and adds:
    have consumed. A robust unlock wipes `FUTEX_WAITERS` and wakes one
    waiter; if that waiter is killed before acting on the wakeup while
    a third task re-acquired the futex, the remaining waiters slept
-   forever on current kernels (deterministic reproducer in `repro/`).
+   forever on current kernels (deterministic and racing reproducers
+   in `repro/`). The replay fires only while `FUTEX_WAITERS` is not
+   re-armed - an observed bit is only ever cleared by an unlock which
+   wakes, so it already guarantees a wakeup from the live owner.
 1. `ROBUST_LIST_COOKIE` — an extensible robust list head
    (`struct robust_list_head2`, selected by size) which makes the exit
    time cleanup compare the futex word against per-entry cookies and a
@@ -122,10 +125,16 @@ cookies for POSIX mutexes without global coordination, is the new part.
   pending-before-entries cleanup order, and the classic-protocol
   lost wakeup test of patch 2, which demonstrably fails on an
   unfixed kernel) and 4 membarrier tests, run under QEMU.
-- `repro/robust_lost_wakeup.c`: a standalone reproducer for the lost
-  wakeup fixed by patch 1 - the waiter times out (would hang forever)
-  on unfixed kernels, verified against the unfixed 6.8 host kernel,
-  and is woken on the patched kernel under QEMU.
+- `repro/robust_lost_wakeup.c`: a standalone deterministic reproducer
+  for the lost wakeup fixed by patch 1 - the waiter times out (would
+  hang forever) on unfixed kernels, verified against the unfixed 6.8
+  host kernel, and is woken on the patched kernel under QEMU.
+- `repro/robust_lost_wakeup_race.c`: the same bug hit by racing the
+  real protocol (honest waiter loops, robust unlock, fast path
+  re-acquire, SIGKILL of the possibly-woken waiter): strands a waiter
+  on a free futex within a handful of kill rounds on the unfixed 6.8
+  host, and cannot strand one on the patched kernel (run as a
+  negative control in the QEMU guest suite).
 - `rfmutex` (in `lib/`): mutual exclusion, cross PID namespace and
   SIGKILL stress tests with EOWNERDEAD recovery for all three cookie
   assignment schemes, plus lifecycle tests (concurrent first attach,

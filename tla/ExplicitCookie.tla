@@ -358,14 +358,17 @@ CleanupPending(t) ==
                ELSE pc' = pc
        ELSE IF pending[t]
        \* handle_futex_death()'s pending op wake cases, both without
-       \* touching the futex value and both unconditional on the
-       \* WAITERS bit (it may have been wiped by the robust unlock):
-       \* a released word (the woken waiter died before taking over
-       \* the lock) and an owner mismatch (the woken waiter died after
-       \* another owner re-acquired; that owner will unlock through
-       \* the uncontended fast path, so the dying task's consumed
-       \* wake up must be replayed to keep the chain alive).
-       THEN /\ IF WakeOnCleanup
+       \* touching the futex value: a released word (the woken waiter
+       \* died before taking over the lock; unconditional on the
+       \* WAITERS bit - the word is free, no future unlock will carry
+       \* the chain) and an owner mismatch (the woken waiter died
+       \* after another owner re-acquired; that owner will unlock
+       \* through the uncontended fast path, so the dying task's
+       \* consumed wake up must be replayed - but only while WAITERS
+       \* is not re-armed: an observed WAITERS bit is only ever
+       \* cleared by an unlock which wakes, so the chain is already
+       \* intact and no wake up was consumed).
+       THEN /\ IF WakeOnCleanup /\ (word.own = 0 \/ ~word.wtr)
                THEN pc' \in Wake1(pc)
                ELSE pc' = pc
             /\ UNCHANGED <<word, corrupt, owner>>

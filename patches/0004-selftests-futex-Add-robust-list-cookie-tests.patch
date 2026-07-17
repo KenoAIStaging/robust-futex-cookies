@@ -1,4 +1,4 @@
-From cf0c8696f1b52ea90635f67b4d1790c7c91c6da0 Mon Sep 17 00:00:00 2001
+From 9a6ab4d77ffd3ce1bee10b3f97f0d4fbb35fe2e9 Mon Sep 17 00:00:00 2001
 From: Keno Fischer <keno@juliahub.com>
 Date: Thu, 16 Jul 2026 08:20:22 +0000
 Subject: [PATCH 4/8] selftests/futex: Add robust list cookie tests
@@ -13,10 +13,11 @@ Exercise the ROBUST_LIST_COOKIE extension:
     woken.
 
   - Exit time cleanup with mismatched cookies: a futex which appears to
-    be owned by somebody else must be left untouched. A mismatched
-    pending op additionally comes with the deterministic replayed
-    wakeup; a mismatched queued entry stays silent and the waiter times
-    out.
+    be owned by somebody else must be left untouched, and the waiting
+    parent - which armed FUTEX_WAITERS before sleeping - times out for
+    both a mismatched queued entry (never woken) and a mismatched
+    pending op (the armed bit keeps the wakeup chain intact, so the
+    consumed-wakeup replay must not fire).
 
   - The pending-before-entries cleanup order: a cookie lease reuse ABA
     reproducer (a lease slot released mid-walk while the parent reuses
@@ -42,11 +43,11 @@ responsibility for the changes.
 
 Signed-off-by: Keno Fischer <keno@juliahub.com>
 ---
- .../selftests/futex/functional/robust_list.c  | 823 +++++++++++++++++-
- 1 file changed, 820 insertions(+), 3 deletions(-)
+ .../selftests/futex/functional/robust_list.c  | 824 +++++++++++++++++-
+ 1 file changed, 821 insertions(+), 3 deletions(-)
 
 diff --git a/tools/testing/selftests/futex/functional/robust_list.c b/tools/testing/selftests/futex/functional/robust_list.c
-index 2baf6c3a0b19..83956c8ac589 100644
+index 6a53ce0533be..508541010f61 100644
 --- a/tools/testing/selftests/futex/functional/robust_list.c
 +++ b/tools/testing/selftests/futex/functional/robust_list.c
 @@ -41,9 +41,13 @@
@@ -79,7 +80,7 @@ index 2baf6c3a0b19..83956c8ac589 100644
  	ASSERT_EQ(ret, -1);
  	ASSERT_EQ(errno, EINVAL);
  
-@@ -889,4 +898,812 @@ TEST_F(futex_op, test_futex_robust_unlock)
+@@ -932,4 +941,813 @@ TEST_F(futex_op, test_futex_robust_unlock)
  	ASSERT_EQ((uintptr_t)(unsigned long)head.list_op_pending, exp);
  }
  
@@ -318,14 +319,15 @@ index 2baf6c3a0b19..83956c8ac589 100644
 +	} else if (error_inject) {
 +		/*
 +		 * A foreign owned lock with the dying child's pending op
-+		 * on it: the kernel must not touch the futex value, but
-+		 * it wakes one potential waiter when discarding the
-+		 * pending op - the dying task may have consumed a wakeup
-+		 * it could no longer act on. This waiter is woken and
-+		 * observes the unchanged word (a real lock loop would
-+		 * re-arm FUTEX_WAITERS and wait again).
++		 * on it: the kernel must not touch the futex value, and
++		 * because this waiter armed FUTEX_WAITERS before sleeping
++		 * the wakeup chain is intact - the consumed-wakeup replay
++		 * (which fires only for a FUTEX_WAITERS-free value) must
++		 * stay silent and the wait times out. The bit-free case
++		 * is covered by test_robust_pending_mismatch_wake.
 +		 */
-+		ASSERT_EQ(ret, 0);
++		ASSERT_EQ(ret, -1);
++		ASSERT_EQ(errno, ETIMEDOUT);
 +		ASSERT_FALSE(atomic_load(futex) & FUTEX_OWNER_DIED);
 +		ASSERT_EQ(atomic_load(futex) & FUTEX_TID_MASK, lock_cookie);
 +	} else {

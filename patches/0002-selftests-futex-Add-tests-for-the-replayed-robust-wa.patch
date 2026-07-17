@@ -1,15 +1,15 @@
-From 0760307d1638571f73b747737e5d7421cbce324a Mon Sep 17 00:00:00 2001
+From f5e2e50f0e49b7d082c133ca6a756d646eb8dd3e Mon Sep 17 00:00:00 2001
 From: Keno Fischer <keno@juliahub.com>
-Date: Fri, 17 Jul 2026 15:44:13 +0000
-Subject: [PATCH 2/8] selftests/futex: Add a test for the replayed robust
- wakeup
+Date: Fri, 17 Jul 2026 22:39:06 +0000
+Subject: [PATCH 2/8] selftests/futex: Add tests for the replayed robust wakeup
 
 Test that the exit time robust list walk wakes a waiter when it
 discards the dying task's pending lock operation because the futex is
-owned by a different, live task - the dying task may have been a woken
-waiter which was killed before it could act on its wakeup, and that
-wakeup would otherwise be lost (the robust unlock which issued it also
-wiped FUTEX_WAITERS, so the futex's new owner will unlock through the
+owned by a different, live task and the futex value does not carry
+FUTEX_WAITERS - the dying task may have been a woken waiter which was
+killed before it could act on its wakeup, and that wakeup would
+otherwise be lost (the robust unlock which issued it also wiped
+FUTEX_WAITERS, so the futex's new owner will unlock through the
 uncontended fast path).
 
 The test constructs the post-race state deterministically instead of
@@ -21,20 +21,26 @@ the futex (flag handshake plus /proc state poll), so the test is not
 timing sensitive. On a kernel without the fix the parent's futex_wait
 times out; with the fix it is woken and the futex value is untouched.
 
+A second test pins down the negative half of the semantics: with
+FUTEX_WAITERS set in the futex value, the walk must not wake anybody -
+the bit guarantees a wakeup from the live owner's unlock, so there is
+no consumed wakeup to compensate and a replay would only cause
+spurious wakeups on every contended exit.
+
 This patch was developed with the assistance of Claude (an AI
 assistant by Anthropic); the author reviewed, validated and takes
 responsibility for the changes.
 
 Signed-off-by: Keno Fischer <keno@juliahub.com>
 ---
- .../selftests/futex/functional/robust_list.c  | 101 ++++++++++++++++++
- 1 file changed, 101 insertions(+)
+ .../selftests/futex/functional/robust_list.c  | 144 ++++++++++++++++++
+ 1 file changed, 144 insertions(+)
 
 diff --git a/tools/testing/selftests/futex/functional/robust_list.c b/tools/testing/selftests/futex/functional/robust_list.c
-index b3fab60181d5..2baf6c3a0b19 100644
+index b3fab60181d5..6a53ce0533be 100644
 --- a/tools/testing/selftests/futex/functional/robust_list.c
 +++ b/tools/testing/selftests/futex/functional/robust_list.c
-@@ -480,6 +480,107 @@ static int child_wait_lock(void *arg)
+@@ -480,6 +480,150 @@ static int child_wait_lock(void *arg)
  	return 0;
  }
  
@@ -131,6 +137,49 @@ index b3fab60181d5..2baf6c3a0b19 100644
 +
 +	/* The futex has a live owner: the walk must not touch its value */
 +	ASSERT_EQ(atomic_load(futex), (unsigned int)tid);
++
++	ASSERT_EQ(wait(&wstatus), pid);
++	ASSERT_TRUE(WIFEXITED(wstatus));
++	ASSERT_EQ(WEXITSTATUS(wstatus), 0);
++
++	ksft_test_result_pass("%s\n", __func__);
++}
++
++/*
++ * The negative half of the replay semantics: with FUTEX_WAITERS set in
++ * the futex value, the walk must not wake anybody. The bit is only
++ * ever cleared by an unlock which issues a wakeup, so it guarantees a
++ * future wakeup from the live owner's unlock - no wakeup was consumed
++ * and a replay would only cause spurious wakeups on every contended
++ * exit. The waiting parent must time out and the futex value must be
++ * untouched.
++ */
++TEST(test_robust_pending_mismatch_waiters_no_wake)
++{
++	struct lock_struct lock = { .futex = 0 };
++	_Atomic(unsigned int) *futex = &lock.futex;
++	struct timespec to = { .tv_sec = FUTEX_TIMEOUT };
++	struct robust_list_head head;
++	pid_t tid = gettid();
++	int ret, pid, wstatus;
++
++	ret = set_list(&head);
++	ASSERT_EQ(ret, 0);
++
++	atomic_store(futex, tid | FUTEX_WAITERS);
++
++	pid = create_child(child_fn_pending_mismatch, &lock);
++	ASSERT_NE(pid, -1);
++
++	atomic_store(&parent_waiting, 1);
++	ret = futex_wait((futex_t *)futex, tid | FUTEX_WAITERS, &to, 0);
++
++	/* No replay with FUTEX_WAITERS armed: the wait must time out */
++	ASSERT_EQ(ret, -1);
++	ASSERT_EQ(errno, ETIMEDOUT);
++
++	/* The futex has a live owner: the walk must not touch its value */
++	ASSERT_EQ(atomic_load(futex), (unsigned int)(tid | FUTEX_WAITERS));
 +
 +	ASSERT_EQ(wait(&wstatus), pid);
 +	ASSERT_TRUE(WIFEXITED(wstatus));

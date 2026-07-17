@@ -1,6 +1,6 @@
-From 4094e1ba15a1ddadc2859bd07e7c37cb40d02ea6 Mon Sep 17 00:00:00 2001
+From 7800d2e0f3a3016a2805ecdd7f0658eb943c2033 Mon Sep 17 00:00:00 2001
 From: Keno Fischer <keno@juliahub.com>
-Date: Fri, 17 Jul 2026 15:48:33 +0000
+Date: Fri, 17 Jul 2026 22:43:00 +0000
 Subject: [PATCH 0/8] futex: PID namespace agnostic robust futexes via owner cookies
 
 Robust futexes identify the lock owner by storing the owner's TID in the
@@ -23,10 +23,15 @@ the futex was re-acquired through the uncontended fast path in the
 meantime, the dying waiter's exit walk discards its pending op (owner
 mismatch) without waking anybody, and the remaining waiters sleep
 forever behind an owner which will never see contention. The fix
-replays the possibly consumed wakeup; a deterministic selftest and
-reproducer demonstrate the hang on current kernels. The window was
-found by model checking the wait/wake interactions (see below). These
-two patches can be taken separately if preferred.
+replays the possibly consumed wakeup when the futex value carries no
+FUTEX_WAITERS (an armed bit is only ever cleared by an unlock which
+wakes, so it already guarantees a wakeup from the live owner);
+deterministic selftests pin down both halves of the semantics, and
+both a deterministic and a racing reproducer demonstrate the hang on
+current kernels - the racing one strands a waiter within a handful of
+kill rounds on a stock 6.8 host. The window was found by model
+checking the wait/wake interactions (see below). These two patches can
+be taken separately if preferred.
 
 The rest of the series makes the owner identifier user space policy:
 
@@ -113,7 +118,7 @@ selftests, matching the existing code in robust_list.c).
 Keno Fischer (8):
   futex: Replay the wakeup consumed by a robust waiter killed before
     acquiring
-  selftests/futex: Add a test for the replayed robust wakeup
+  selftests/futex: Add tests for the replayed robust wakeup
   futex: Add ROBUST_LIST_COOKIE for PID namespace agnostic robust lists
   selftests/futex: Add robust list cookie tests
   futex/vdso: Implement __vdso_futex_robust_list{64,32}_cmpxchg_rseq()
@@ -141,16 +146,16 @@ Keno Fischer (8):
  include/linux/syscalls.h                      |    3 +-
  include/uapi/linux/futex.h                    |   69 +
  include/uapi/linux/membarrier.h               |   34 +
- include/vdso/futex.h                          |   91 ++
- kernel/futex/core.c                           |  341 +++-
+ include/vdso/futex.h                          |   91 +
+ kernel/futex/core.c                           |  346 +++-
  kernel/futex/futex.h                          |    9 +
  kernel/futex/syscalls.c                       |  129 +-
  kernel/sched/membarrier.c                     |  269 ++-
- .../selftests/futex/functional/robust_list.c  | 1445 ++++++++++++++++-
+ .../selftests/futex/functional/robust_list.c  | 1489 ++++++++++++++++-
  tools/testing/selftests/membarrier/.gitignore |    1 +
  tools/testing/selftests/membarrier/Makefile   |    6 +
  .../membarrier/membarrier_shared_rseq_test.c  |  432 +++++
- 28 files changed, 3175 insertions(+), 50 deletions(-)
+ 28 files changed, 3224 insertions(+), 50 deletions(-)
  create mode 100644 Documentation/litmus-tests/membarrier/membarrier-shared-rseq-ready.litmus
  create mode 100644 tools/testing/selftests/membarrier/membarrier_shared_rseq_test.c
 

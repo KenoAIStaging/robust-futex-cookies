@@ -61,7 +61,7 @@ artifact provenance).
 
 | Config                | Models                                            | Result |
 |-----------------------|---------------------------------------------------|--------|
-| MCExplicitOK          | final ABI + fixed walk order (pending first) + lease-last list order + cleanup wake + WAITERS re-assertion; 3 threads, 3 leased cookies, waiters modeled | PASS, exhaustive, deadlock checking on: TypeOK/NoCorruption/Exclusion + Recovery + NoLostWakeup; 115.2M generated / 33.5M distinct |
+| MCExplicitOK          | final ABI + fixed walk order (pending first) + lease-last list order + cleanup wake + WAITERS re-assertion; 3 threads, 3 leased cookies, waiters modeled | PASS, exhaustive, deadlock checking on: TypeOK/NoCorruption/Exclusion + Recovery + NoLostWakeup; 114.9M generated / 33.5M distinct (with the WAITERS-guarded mismatch replay) |
 | MCExplicitNoWake      | as OK but the exit cleanup never wakes             | NoLostWakeup **violated** (sleeping waiters never woken after owner death) |
 | MCExplicitLostWaiter  | as OK but woken acquirers do not re-assert WAITERS | NoLostWakeup **violated** (the lost waiter bug: kernel unlock wiped the bit, the woken waiter's fast-path unlock strands the rest) |
 | MCExplicitLeaseABA    | as OK but historical walk order (entries, then pending) | NoCorruption **violated** (lease released before the stale pending op: issue #1) |
@@ -145,7 +145,12 @@ artifact provenance).
    may be gone precisely because the robust unlock wiped it), and the
    futex wait loop must re-assert WAITERS whenever it observes an owned
    lock (a waiter that could "spin without re-asserting" does not exist
-   in the code and produces spurious strands in the model). Per-waiter
+   in the code and produces spurious strands in the model). The
+   owner-mismatch replay, by contrast, is correctly *guarded* on the
+   WAITERS bit: an observed bit is only ever cleared by an unlock which
+   wakes, so it already guarantees a future wakeup from the live owner
+   - TLC confirms NoLostWakeup with the replay restricted to
+   WAITERS-free values (and the negative variants still fail). Per-waiter
    starvation freedom is deliberately not claimed: with FUTEX_WAKE(1)
    and no wake ordering promise, TLC exhibits the classic starvation
    lasso, which is inherent to futex based locks. The owner-mismatch
