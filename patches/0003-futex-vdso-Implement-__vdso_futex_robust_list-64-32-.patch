@@ -1,4 +1,4 @@
-From 2dce0f490d99c8626571319e2f64f96064893847 Mon Sep 17 00:00:00 2001
+From 1b97be253231dbf366f573ad603e66e239a2da1c Mon Sep 17 00:00:00 2001
 From: Keno Fischer <keno@juliahub.com>
 Date: Thu, 16 Jul 2026 08:22:29 +0000
 Subject: [PATCH 3/6] futex/vdso: Implement
@@ -132,10 +132,10 @@ Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
  14 files changed, 431 insertions(+), 7 deletions(-)
 
 diff --git a/Documentation/locking/robust-futex-ABI.rst b/Documentation/locking/robust-futex-ABI.rst
-index 662f0a693b85..e6e96ab23776 100644
+index 5265fdabcd04..208bc025b205 100644
 --- a/Documentation/locking/robust-futex-ABI.rst
 +++ b/Documentation/locking/robust-futex-ABI.rst
-@@ -276,7 +276,10 @@ all tasks which can hold the lock, the same way TIDs are unique among
+@@ -302,7 +302,10 @@ all tasks which can hold the lock, the same way TIDs are unique among
  all tasks within one PID namespace. Uniqueness can be organized, for
  instance, with allocation tables in the shared memory itself (with the
  allocations guarded by robust futexes on the table slots), with OFD
@@ -646,10 +646,10 @@ index 3cd175eefe64..2796bcf42a27 100644
 +
  #endif
 diff --git a/kernel/futex/core.c b/kernel/futex/core.c
-index bd50e5969131..bd3b0b36d286 100644
+index 510a1619b627..6c029fe3d2fd 100644
 --- a/kernel/futex/core.c
 +++ b/kernel/futex/core.c
-@@ -1485,11 +1485,121 @@ void __futex_fixup_robust_unlock(struct pt_regs *regs, struct futex_unlock_cs_ra
+@@ -1556,11 +1556,121 @@ void __futex_fixup_robust_unlock(struct pt_regs *regs, struct futex_unlock_cs_ra
  	futex_robust_list_clear_pending(pop, csr->pop_size32 ? FLAGS_ROBUST_LIST32 : 0);
  }
  
@@ -772,7 +772,7 @@ index bd50e5969131..bd3b0b36d286 100644
  		exit_robust_list(tsk);
  		tsk->futex.robust_list = NULL;
  		tsk->futex.robust_list_flags = 0;
-@@ -1497,6 +1607,7 @@ static void futex_cleanup(struct task_struct *tsk)
+@@ -1568,6 +1678,7 @@ static void futex_cleanup(struct task_struct *tsk)
  
  #ifdef CONFIG_COMPAT
  	if (unlikely(tsk->futex.compat_robust_list)) {
@@ -780,7 +780,7 @@ index bd50e5969131..bd3b0b36d286 100644
  		compat_exit_robust_list(tsk);
  		tsk->futex.compat_robust_list = NULL;
  		tsk->futex.compat_robust_list_flags = 0;
-@@ -2023,13 +2134,15 @@ static void futex_invalidate_cs_ranges(struct futex_mm_data *fd)
+@@ -2094,13 +2205,15 @@ static void futex_invalidate_cs_ranges(struct futex_mm_data *fd)
  	 * tasks as they use VDSO32 which does not provide the 64-bit pointer
  	 * variant.
  	 */

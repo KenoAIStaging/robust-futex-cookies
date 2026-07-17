@@ -1,4 +1,4 @@
-From 0c221ffebf396da284dfc9ad17488d60e12839e9 Mon Sep 17 00:00:00 2001
+From 86d5b42589d373193b2b10a7e1f14a25bbd2df8d Mon Sep 17 00:00:00 2001
 From: Keno Fischer <keno@juliahub.com>
 Date: Thu, 16 Jul 2026 08:22:52 +0000
 Subject: [PATCH 5/6] sched/membarrier: Add
@@ -59,12 +59,23 @@ barrier which orders it against subsequent memory accesses.
 
 Signed-off-by: Keno Fischer <keno@juliahub.com>
 Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+
+squash! sched/membarrier: Add MEMBARRIER_CMD_SHARED_EXPEDITED_RSEQ
+
+Publish the registration state with a full barrier after the READY bit:
+atomic_or() does not order anything by itself, so without the barrier a
+memory access following the syscall return (the start of an RSEQ
+protected sequence) could be performed before READY is visible, and a
+concurrent fence which does not observe READY would incorrectly skip a
+task whose sequence already started. The barrier pairs with the
+smp_mb() at the beginning of membarrier_shared_expedited_rseq(),
+resolving the store-buffering case.
 ---
  include/linux/sched/mm.h        |   2 +
  include/linux/syscalls.h        |   3 +-
- include/uapi/linux/membarrier.h |  34 ++++++
- kernel/sched/membarrier.c       | 204 +++++++++++++++++++++++++++++++-
- 4 files changed, 239 insertions(+), 4 deletions(-)
+ include/uapi/linux/membarrier.h |  34 +++++
+ kernel/sched/membarrier.c       | 215 +++++++++++++++++++++++++++++++-
+ 4 files changed, 250 insertions(+), 4 deletions(-)
 
 diff --git a/include/linux/sched/mm.h b/include/linux/sched/mm.h
 index 95d0040df584..8741d4d794b0 100644
@@ -146,7 +157,7 @@ index 5f3ad6d5be6f..e23b65bedd8b 100644
  	/* Alias for header backward compatibility. */
  	MEMBARRIER_CMD_SHARED			= MEMBARRIER_CMD_GLOBAL,
 diff --git a/kernel/sched/membarrier.c b/kernel/sched/membarrier.c
-index cb957b8f1946..5ea2647f593e 100644
+index cb957b8f1946..1b6d66596b27 100644
 --- a/kernel/sched/membarrier.c
 +++ b/kernel/sched/membarrier.c
 @@ -5,6 +5,8 @@
@@ -181,7 +192,7 @@ index cb957b8f1946..5ea2647f593e 100644
  	| MEMBARRIER_CMD_GET_REGISTRATIONS)
  
  /*
-@@ -442,6 +453,179 @@ static int membarrier_private_expedited(int flags, int cpu_id)
+@@ -442,6 +453,190 @@ static int membarrier_private_expedited(int flags, int cpu_id)
  	return 0;
  }
  
@@ -332,19 +343,30 @@ index cb957b8f1946..5ea2647f593e 100644
 +	if (atomic_read(&mm->membarrier_state) &
 +	    MEMBARRIER_STATE_SHARED_EXPEDITED_RSEQ_READY)
 +		return 0;
-+	atomic_or(MEMBARRIER_STATE_SHARED_EXPEDITED_RSEQ, &mm->membarrier_state);
++	atomic_or(MEMBARRIER_STATE_SHARED_EXPEDITED_RSEQ |
++		  MEMBARRIER_STATE_SHARED_EXPEDITED_RSEQ_READY,
++		  &mm->membarrier_state);
 +
 +	/*
 +	 * Unlike the other registrations no runqueue state has to be
-+	 * updated, as eligibility is solely based on mm::membarrier_state,
-+	 * which a concurrent fence reads after the atomic_or() above is
-+	 * globally visible: ensure that no memory access following the
-+	 * registration is reordered before the registration.
++	 * updated: eligibility is solely based on mm::membarrier_state.
++	 *
++	 * atomic_or() does not return a value and therefore does not
++	 * order anything by itself. The full barrier orders the READY
++	 * publication before every access which follows the registration
++	 * in program order - in particular the first user space access
++	 * of an RSEQ protected sequence started after the syscall
++	 * returns. It pairs with the smp_mb() at the beginning of
++	 * membarrier_shared_expedited_rseq() (via guard(mb)), which
++	 * separates the fence caller's prior writes from its
++	 * mm::membarrier_state read. This resolves the store-buffering
++	 * case: either a concurrent fence observes READY and IPIs the
++	 * registered task, or the task's post-registration sequence
++	 * observes everything the fence caller wrote before fencing, so
++	 * a fence can never skip a task whose protected sequence already
++	 * started.
 +	 */
 +	smp_mb__after_atomic();
-+
-+	atomic_or(MEMBARRIER_STATE_SHARED_EXPEDITED_RSEQ_READY,
-+		  &mm->membarrier_state);
 +	return 0;
 +}
 +#else  /* CONFIG_RSEQ && CONFIG_MMU */
@@ -361,7 +383,7 @@ index cb957b8f1946..5ea2647f593e 100644
  static int sync_runqueues_membarrier_state(struct mm_struct *mm)
  {
  	int membarrier_state = atomic_read(&mm->membarrier_state);
-@@ -574,13 +758,16 @@ static int membarrier_get_registrations(void)
+@@ -574,13 +769,16 @@ static int membarrier_get_registrations(void)
  		MEMBARRIER_STATE_PRIVATE_EXPEDITED_SYNC_CORE |
  			MEMBARRIER_STATE_PRIVATE_EXPEDITED_SYNC_CORE_READY,
  		MEMBARRIER_STATE_PRIVATE_EXPEDITED_RSEQ |
@@ -380,7 +402,7 @@ index cb957b8f1946..5ea2647f593e 100644
  	};
  	BUILD_BUG_ON(ARRAY_SIZE(states) != ARRAY_SIZE(registration_cmds));
  
-@@ -606,6 +793,12 @@ static int membarrier_get_registrations(void)
+@@ -606,6 +804,12 @@ static int membarrier_get_registrations(void)
   * @cpu_id: if @flags == MEMBARRIER_CMD_FLAG_CPU, indicates the cpu on which
   *          RSEQ CS should be interrupted (@cmd must be
   *          MEMBARRIER_CMD_PRIVATE_EXPEDITED_RSEQ).
@@ -393,7 +415,7 @@ index cb957b8f1946..5ea2647f593e 100644
   *
   * If this system call is not implemented, -ENOSYS is returned. If the
   * command specified does not exist, not available on the running
-@@ -631,7 +824,8 @@ static int membarrier_get_registrations(void)
+@@ -631,7 +835,8 @@ static int membarrier_get_registrations(void)
   *        smp_mb()           X           O            O
   *        sys_membarrier()   O           O            O
   */
@@ -403,7 +425,7 @@ index cb957b8f1946..5ea2647f593e 100644
  {
  	switch (cmd) {
  	case MEMBARRIER_CMD_PRIVATE_EXPEDITED_RSEQ:
-@@ -680,6 +874,10 @@ SYSCALL_DEFINE3(membarrier, int, cmd, unsigned int, flags, int, cpu_id)
+@@ -680,6 +885,10 @@ SYSCALL_DEFINE3(membarrier, int, cmd, unsigned int, flags, int, cpu_id)
  		return membarrier_register_private_expedited(MEMBARRIER_FLAG_RSEQ);
  	case MEMBARRIER_CMD_GET_REGISTRATIONS:
  		return membarrier_get_registrations();

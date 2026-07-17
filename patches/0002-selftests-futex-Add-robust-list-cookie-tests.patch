@@ -1,4 +1,4 @@
-From c4764b8c3ae2959f9dfaf4f649b0f3cbd3ccf4df Mon Sep 17 00:00:00 2001
+From 2e440e700a63bab4c0b5b28eeac5d13b0a819bbc Mon Sep 17 00:00:00 2001
 From: Keno Fischer <keno@juliahub.com>
 Date: Thu, 16 Jul 2026 08:20:22 +0000
 Subject: [PATCH 2/6] selftests/futex: Add robust list cookie tests
@@ -28,12 +28,21 @@ futex_wait() timeout accordingly.
 
 Signed-off-by: Keno Fischer <keno@juliahub.com>
 Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+
+squash! selftests/futex: Add robust list cookie tests
+
+Add tests for the pending-before-entries cleanup order: a cookie lease
+reuse ABA reproducer (a lease slot released mid-walk while the parent
+reuses the cookie on the pending op's lock), a linked pending op whose
+->next is overwritten by a new owner mid-walk, a pending op linked at
+every list position and an unreadable pending op which must not
+suppress the cleanup of valid entries.
 ---
- .../selftests/futex/functional/robust_list.c  | 467 +++++++++++++++++-
- 1 file changed, 464 insertions(+), 3 deletions(-)
+ .../selftests/futex/functional/robust_list.c  | 810 +++++++++++++++++-
+ 1 file changed, 807 insertions(+), 3 deletions(-)
 
 diff --git a/tools/testing/selftests/futex/functional/robust_list.c b/tools/testing/selftests/futex/functional/robust_list.c
-index b3fab60181d5..f4ceab854ca2 100644
+index b3fab60181d5..120968f140b1 100644
 --- a/tools/testing/selftests/futex/functional/robust_list.c
 +++ b/tools/testing/selftests/futex/functional/robust_list.c
 @@ -41,9 +41,13 @@
@@ -66,7 +75,7 @@ index b3fab60181d5..f4ceab854ca2 100644
  	ASSERT_EQ(ret, -1);
  	ASSERT_EQ(errno, EINVAL);
  
-@@ -788,4 +797,456 @@ TEST_F(futex_op, test_futex_robust_unlock)
+@@ -788,4 +797,799 @@ TEST_F(futex_op, test_futex_robust_unlock)
  	ASSERT_EQ((uintptr_t)(unsigned long)head.list_op_pending, exp);
  }
  
@@ -520,6 +529,349 @@ index b3fab60181d5..f4ceab854ca2 100644
 +TEST(test_pidns_cookie)
 +{
 +	pidns_collision_test(_metadata, true);
++}
++
++/*
++ * Exit cleanup ordering: on a ROBUST_LIST_COOKIE list the pending op
++ * must be handled before the queued entries. A queued entry can be the
++ * lease which keeps the pending cookie allocated (e.g. a registry
++ * slot): if the kernel released the lease first, a new task could
++ * reuse the cookie and legitimately acquire the lock the stale pending
++ * op refers to, and the late pending handling would mark the live
++ * owner's lock FUTEX_OWNER_DIED.
++ *
++ * The parent plays the reusing task: it waits (as a futex waiter) for
++ * the lease slot to be released by the exit cleanup, immediately
++ * re-acquires the pending op's lock under the same cookie and verifies
++ * that the lock is not marked dead behind its back. On a fixed kernel
++ * the pending op is processed before the lease wakeup, so the check is
++ * deterministic; on a kernel with the inverted order the padding locks
++ * walked between the lease slot and the end of the list give the
++ * parent a wide window to expose the misattribution.
++ */
++#define LEASE_PADS	256
++#define ORDER_ITERS	20
++
++struct lease_aba_region {
++	struct lock_struct2	slot;
++	struct lock_struct2	mutex;
++	struct lock_struct2	pads[LEASE_PADS];
++	_Atomic(int)		ready;
++};
++
++static int child_fn_lease_aba(void *arg)
++{
++	struct lease_aba_region *r = arg;
++	struct robust_list_head2 head2;
++	int i;
++
++	if (set_list2(&head2, ROBUST_LIST_COOKIE))
++		return 1;
++
++	/*
++	 * Hold the padding locks. The list is walked in reverse locking
++	 * order, so they are processed after the lease slot.
++	 */
++	for (i = 0; i < LEASE_PADS; i++) {
++		if (mutex_lock_cookie(&r->pads[i], &head2, COOKIE_A, false))
++			return 1;
++	}
++	/* Take the lease slot last: it is walked first */
++	if (mutex_lock_cookie(&r->slot, &head2, COOKIE_A, false))
++		return 1;
++	/* The parent waits for the slot to be released by the cleanup */
++	atomic_fetch_or(&r->slot.futex, FUTEX_WAITERS);
++
++	/* Die in the middle of locking r->mutex */
++	head2.list_op_pending_cookie = COOKIE_A;
++	head2.head.list_op_pending = &r->mutex.list;
++
++	atomic_store(&r->ready, 1);
++	return 0;
++}
++
++/*
++ * Wait until the exit cleanup marked @lock dead. Busy polling instead
++ * of a futex wait: the reaction time of the "cookie reusing" parent
++ * must be short against the remainder of the exit walk, and the wake up
++ * path of a futex wait is much slower than the cleanup of the remaining
++ * entries.
++ */
++static void wait_owner_died(struct __test_metadata *_metadata,
++			    struct lock_struct2 *lock)
++{
++	long i;
++
++	for (i = 0; i < 400000000L; i++) {
++		if (atomic_load(&lock->futex) & FUTEX_OWNER_DIED)
++			return;
++	}
++	ASSERT_TRUE(atomic_load(&lock->futex) & FUTEX_OWNER_DIED);
++}
++
++TEST(test_cookie_lease_reuse_pending)
++{
++	struct lease_aba_region *r;
++	int it, pid, wstatus;
++	char *stack;
++
++	r = mmap(NULL, sizeof(*r), PROT_READ | PROT_WRITE,
++		 MAP_SHARED | MAP_ANONYMOUS, -1, 0);
++	ASSERT_NE(r, MAP_FAILED);
++	stack = mmap(NULL, STACK_SIZE, PROT_READ | PROT_WRITE,
++		     MAP_PRIVATE | MAP_ANONYMOUS | MAP_STACK, -1, 0);
++	ASSERT_NE(stack, MAP_FAILED);
++
++	for (it = 0; it < ORDER_ITERS; it++) {
++		memset(r, 0, sizeof(*r));
++
++		pid = clone(child_fn_lease_aba, stack + STACK_SIZE,
++			    CLONE_VM | SIGCHLD, r);
++		ASSERT_NE(pid, -1);
++
++		/* Busy poll: the parent must already spin on the slot when
++		 * the exit walk starts, see wait_owner_died().
++		 */
++		while (!atomic_load(&r->ready))
++			;
++
++		/* Wait for the exit cleanup to release the lease slot */
++		wait_owner_died(_metadata, &r->slot);
++
++		/* Reuse the cookie: acquire the pending op's lock */
++		atomic_store(&r->mutex.futex, COOKIE_A);
++
++		/* The exit cleanup is complete once the child is reapable */
++		ASSERT_EQ(waitpid(pid, &wstatus, 0), pid);
++		ASSERT_EQ(WEXITSTATUS(wstatus), 0);
++
++		/* The reused lock is live and must not be marked dead */
++		ASSERT_EQ(atomic_load(&r->mutex.futex), COOKIE_A);
++	}
++
++	munmap(stack, STACK_SIZE);
++	munmap(r, sizeof(*r));
++	ksft_test_result_pass("%s\n", __func__);
++}
++
++/*
++ * The pending op entry can already be linked into the list (death after
++ * requeueing, before the pending op is cleared). Because the pending op
++ * is handled before the list walk, a new owner can re-acquire the lock
++ * and requeue the entry on its own list - overwriting ->next - while
++ * the walk is still in progress. The walk must traverse via the
++ * successor fetched before the pending op was handled, otherwise the
++ * remainder of the dead task's list is leaked (or worse, the walk
++ * wanders into the new owner's list).
++ */
++struct pend_linked_region {
++	struct lock_struct2	after;	/* walked after the pending entry */
++	struct lock_struct2	plock;	/* pending op, already linked */
++	struct lock_struct2	before;	/* walked before the pending entry */
++	struct lock_struct2	decoy;
++	_Atomic(int)		ready;
++};
++
++static int child_fn_pending_linked(void *arg)
++{
++	struct pend_linked_region *r = arg;
++	struct robust_list_head2 head2;
++
++	if (set_list2(&head2, ROBUST_LIST_COOKIE))
++		return 1;
++
++	if (mutex_lock_cookie(&r->after, &head2, COOKIE_A, false) ||
++	    mutex_lock_cookie(&r->plock, &head2, COOKIE_A, false) ||
++	    mutex_lock_cookie(&r->before, &head2, COOKIE_A, false))
++		return 1;
++
++	/* The parent waits for plock's cleanup */
++	atomic_fetch_or(&r->plock.futex, FUTEX_WAITERS);
++
++	/* Death after requeueing, before clearing the pending op */
++	head2.list_op_pending_cookie = COOKIE_A;
++	head2.head.list_op_pending = &r->plock.list;
++
++	atomic_store(&r->ready, 1);
++	return 0;
++}
++
++TEST(test_pending_linked_next_overwrite)
++{
++	struct pend_linked_region *r;
++	int it, pid, wstatus;
++	char *stack;
++
++	r = mmap(NULL, sizeof(*r), PROT_READ | PROT_WRITE,
++		 MAP_SHARED | MAP_ANONYMOUS, -1, 0);
++	ASSERT_NE(r, MAP_FAILED);
++	stack = mmap(NULL, STACK_SIZE, PROT_READ | PROT_WRITE,
++		     MAP_PRIVATE | MAP_ANONYMOUS | MAP_STACK, -1, 0);
++	ASSERT_NE(stack, MAP_FAILED);
++
++	for (it = 0; it < ORDER_ITERS; it++) {
++		memset(r, 0, sizeof(*r));
++		/* Off-list self referencing entry, never terminates */
++		r->decoy.list.next = &r->decoy.list;
++
++		pid = clone(child_fn_pending_linked, stack + STACK_SIZE,
++			    CLONE_VM | SIGCHLD, r);
++		ASSERT_NE(pid, -1);
++
++		/* See test_cookie_lease_reuse_pending */
++		while (!atomic_load(&r->ready))
++			;
++
++		/* Wait for the pending op handling to release plock */
++		wait_owner_died(_metadata, &r->plock);
++
++		/*
++		 * Re-acquire it and requeue the entry on "another list":
++		 * a walk which re-reads ->next gets stuck on the decoy
++		 * and never reaches the rest of the dead task's list.
++		 */
++		atomic_store(&r->plock.futex, COOKIE_A);
++		r->plock.list.next = &r->decoy.list;
++
++		ASSERT_EQ(waitpid(pid, &wstatus, 0), pid);
++		ASSERT_EQ(WEXITSTATUS(wstatus), 0);
++
++		/* The whole dead task's list must have been cleaned */
++		ASSERT_EQ(atomic_load(&r->before.futex), FUTEX_OWNER_DIED);
++		ASSERT_EQ(atomic_load(&r->after.futex), FUTEX_OWNER_DIED);
++		/* The re-acquired lock is live and must be untouched */
++		ASSERT_EQ(atomic_load(&r->plock.futex), COOKIE_A);
++	}
++
++	munmap(stack, STACK_SIZE);
++	munmap(r, sizeof(*r));
++	ksft_test_result_pass("%s\n", __func__);
++}
++
++/*
++ * Deterministic coverage of an already linked pending op at every list
++ * position: all held locks must be released exactly once.
++ */
++struct pend_pos_region {
++	struct lock_struct2	locks[3];
++	int			pos;
++	_Atomic(int)		ready;
++};
++
++static int child_fn_pending_position(void *arg)
++{
++	struct pend_pos_region *r = arg;
++	struct robust_list_head2 head2;
++	int i;
++
++	if (set_list2(&head2, ROBUST_LIST_COOKIE))
++		return 1;
++
++	for (i = 0; i < 3; i++) {
++		if (mutex_lock_cookie(&r->locks[i], &head2, COOKIE_A, false))
++			return 1;
++	}
++
++	head2.list_op_pending_cookie = COOKIE_A;
++	head2.head.list_op_pending = &r->locks[r->pos].list;
++
++	atomic_store(&r->ready, 1);
++	return 0;
++}
++
++TEST(test_pending_linked_positions)
++{
++	struct pend_pos_region *r;
++	int pos, i, pid, wstatus;
++	char *stack;
++
++	r = mmap(NULL, sizeof(*r), PROT_READ | PROT_WRITE,
++		 MAP_SHARED | MAP_ANONYMOUS, -1, 0);
++	ASSERT_NE(r, MAP_FAILED);
++	stack = mmap(NULL, STACK_SIZE, PROT_READ | PROT_WRITE,
++		     MAP_PRIVATE | MAP_ANONYMOUS | MAP_STACK, -1, 0);
++	ASSERT_NE(stack, MAP_FAILED);
++
++	for (pos = 0; pos < 3; pos++) {
++		memset(r, 0, sizeof(*r));
++		r->pos = pos;
++
++		pid = clone(child_fn_pending_position, stack + STACK_SIZE,
++			    CLONE_VM | SIGCHLD, r);
++		ASSERT_NE(pid, -1);
++
++		ASSERT_EQ(waitpid(pid, &wstatus, 0), pid);
++		ASSERT_EQ(WEXITSTATUS(wstatus), 0);
++
++		for (i = 0; i < 3; i++)
++			ASSERT_EQ(atomic_load(&r->locks[i].futex),
++				  FUTEX_OWNER_DIED);
++	}
++
++	munmap(stack, STACK_SIZE);
++	munmap(r, sizeof(*r));
++	ksft_test_result_pass("%s\n", __func__);
++}
++
++/*
++ * An unreadable pending op entry must not suppress the cleanup of the
++ * valid queued entries.
++ */
++struct pend_fault_region {
++	struct lock_struct2	lock;
++	struct robust_list	*bad_entry;
++	_Atomic(int)		ready;
++};
++
++static int child_fn_pending_fault(void *arg)
++{
++	struct pend_fault_region *r = arg;
++	struct robust_list_head2 head2;
++
++	if (set_list2(&head2, ROBUST_LIST_COOKIE))
++		return 1;
++
++	if (mutex_lock_cookie(&r->lock, &head2, COOKIE_A, false))
++		return 1;
++
++	head2.list_op_pending_cookie = COOKIE_A;
++	head2.head.list_op_pending = r->bad_entry;
++
++	atomic_store(&r->ready, 1);
++	return 0;
++}
++
++TEST(test_pending_fault)
++{
++	struct pend_fault_region *r;
++	int pid, wstatus;
++	char *stack, *noaccess;
++
++	r = mmap(NULL, sizeof(*r), PROT_READ | PROT_WRITE,
++		 MAP_SHARED | MAP_ANONYMOUS, -1, 0);
++	ASSERT_NE(r, MAP_FAILED);
++	noaccess = mmap(NULL, 4096, PROT_NONE,
++			MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
++	ASSERT_NE(noaccess, MAP_FAILED);
++	stack = mmap(NULL, STACK_SIZE, PROT_READ | PROT_WRITE,
++		     MAP_PRIVATE | MAP_ANONYMOUS | MAP_STACK, -1, 0);
++	ASSERT_NE(stack, MAP_FAILED);
++
++	r->bad_entry = (struct robust_list *)(noaccess + 128);
++
++	pid = clone(child_fn_pending_fault, stack + STACK_SIZE,
++		    CLONE_VM | SIGCHLD, r);
++	ASSERT_NE(pid, -1);
++
++	ASSERT_EQ(waitpid(pid, &wstatus, 0), pid);
++	ASSERT_EQ(WEXITSTATUS(wstatus), 0);
++
++	ASSERT_EQ(atomic_load(&r->lock.futex), FUTEX_OWNER_DIED);
++
++	munmap(stack, STACK_SIZE);
++	munmap(noaccess, 4096);
++	munmap(r, sizeof(*r));
++	ksft_test_result_pass("%s\n", __func__);
 +}
 +
  TEST_HARNESS_MAIN

@@ -1,6 +1,6 @@
-From 378b31935b99bfe5f697cfb9c570e172ea8b4a7e Mon Sep 17 00:00:00 2001
-From: Keno Fischer <keno@juliahub.com>
-Date: Thu, 16 Jul 2026 08:28:45 +0000
+From b48e689991cbf075f6d28574cc45ed45043cd780 Mon Sep 17 00:00:00 2001
+From: Keno Fischer <Keno@users.noreply.github.com>
+Date: Fri, 17 Jul 2026 04:35:06 +0000
 Subject: [PATCH 0/6] futex: PID namespace agnostic robust futexes via owner cookies
 
 Robust futexes identify the lock owner by storing the owner's TID in the
@@ -22,10 +22,13 @@ word). With ROBUST_LIST_COOKIE set, the exit walk compares the futex
 word against a user space managed 32-bit cookie instead of the TID: for
 queued entries a cookie stored at cookie_offset relative to the entry
 (written only by the lock owner), for the pending operation the task
-private list_op_pending_cookie. This alone suffices for robust mutexes
-whose users can assign unique cookies out of band, e.g. via allocation
-tables in the shared memory itself or via OFD file locks, both of which
-release the identifier no earlier than the holder's exit cleanup.
+private list_op_pending_cookie. The exit walk handles the pending
+operation before the queued entries, since a queued entry can be the
+lease which keeps the pending cookie allocated. This alone suffices for
+robust mutexes whose users can assign unique cookies out of band, e.g.
+via allocation tables in the shared memory itself (ordered after all
+held locks in the list) or via OFD file locks, both of which release
+the identifier no earlier than the holder's exit cleanup.
 
 For POSIX style process shared mutexes, which have no natural home for
 an allocation protocol, a per lock reservation counter can provide the
@@ -100,33 +103,33 @@ Keno Fischer (6):
   selftests/membarrier: Add tests for
     MEMBARRIER_CMD_SHARED_EXPEDITED_RSEQ
 
- Documentation/locking/robust-futex-ABI.rst    |  59 ++
- arch/x86/entry/vdso/common/vfutex.c           | 126 +++
- arch/x86/entry/vdso/vdso32/vdso32.lds.S       |   1 +
- arch/x86/entry/vdso/vdso64/vdso64.lds.S       |   2 +
- arch/x86/entry/vdso/vdso64/vdsox32.lds.S      |   2 +
- arch/x86/entry/vdso/vma.c                     |  12 +
- arch/x86/include/asm/futex_robust.h           |  15 +
- arch/x86/include/asm/vdso.h                   |   6 +
- arch/x86/tools/vdso2c.c                       |   6 +
- include/linux/compat.h                        |   8 +
- include/linux/futex.h                         |  11 +
- include/linux/futex_types.h                   |  24 +-
- include/linux/rseq_entry.h                    |  32 +-
- include/linux/sched/mm.h                      |   2 +
- include/linux/syscalls.h                      |   3 +-
- include/uapi/linux/futex.h                    |  58 ++
- include/uapi/linux/membarrier.h               |  34 +
- include/vdso/futex.h                          |  83 ++
- kernel/futex/core.c                           | 205 ++++-
- kernel/futex/futex.h                          |   9 +
- kernel/futex/syscalls.c                       |  66 +-
- kernel/sched/membarrier.c                     | 204 ++++-
- .../selftests/futex/functional/robust_list.c  | 731 +++++++++++++++++-
- tools/testing/selftests/membarrier/.gitignore |   1 +
- tools/testing/selftests/membarrier/Makefile   |   3 +-
- .../membarrier/membarrier_shared_rseq_test.c  | 335 ++++++++
- 26 files changed, 2002 insertions(+), 36 deletions(-)
+ Documentation/locking/robust-futex-ABI.rst    |   85 ++
+ arch/x86/entry/vdso/common/vfutex.c           |  126 ++
+ arch/x86/entry/vdso/vdso32/vdso32.lds.S       |    1 +
+ arch/x86/entry/vdso/vdso64/vdso64.lds.S       |    2 +
+ arch/x86/entry/vdso/vdso64/vdsox32.lds.S      |    2 +
+ arch/x86/entry/vdso/vma.c                     |   12 +
+ arch/x86/include/asm/futex_robust.h           |   15 +
+ arch/x86/include/asm/vdso.h                   |    6 +
+ arch/x86/tools/vdso2c.c                       |    6 +
+ include/linux/compat.h                        |    8 +
+ include/linux/futex.h                         |   11 +
+ include/linux/futex_types.h                   |   24 +-
+ include/linux/rseq_entry.h                    |   32 +-
+ include/linux/sched/mm.h                      |    2 +
+ include/linux/syscalls.h                      |    3 +-
+ include/uapi/linux/futex.h                    |   58 +
+ include/uapi/linux/membarrier.h               |   34 +
+ include/vdso/futex.h                          |   83 ++
+ kernel/futex/core.c                           |  290 +++-
+ kernel/futex/futex.h                          |    9 +
+ kernel/futex/syscalls.c                       |   66 +-
+ kernel/sched/membarrier.c                     |  215 ++-
+ .../selftests/futex/functional/robust_list.c  | 1220 ++++++++++++++++-
+ tools/testing/selftests/membarrier/.gitignore |    1 +
+ tools/testing/selftests/membarrier/Makefile   |    3 +-
+ .../membarrier/membarrier_shared_rseq_test.c  |  416 ++++++
+ 26 files changed, 2687 insertions(+), 43 deletions(-)
  create mode 100644 tools/testing/selftests/membarrier/membarrier_shared_rseq_test.c
 
 -- 

@@ -1,4 +1,4 @@
-From fe2fddb22456953d48f3ff9f112ed65a01424568 Mon Sep 17 00:00:00 2001
+From b48e689991cbf075f6d28574cc45ed45043cd780 Mon Sep 17 00:00:00 2001
 From: Keno Fischer <keno@juliahub.com>
 Date: Thu, 16 Jul 2026 08:23:02 +0000
 Subject: [PATCH 6/6] selftests/membarrier: Add tests for

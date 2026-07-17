@@ -1,4 +1,4 @@
-From fac77e12a08f1b08c250de34e819f535ba0f7ccd Mon Sep 17 00:00:00 2001
+From 2fbe4361307c83b00ce436d87fad90afd48ff347 Mon Sep 17 00:00:00 2001
 From: Keno Fischer <keno@juliahub.com>
 Date: Thu, 16 Jul 2026 08:19:53 +0000
 Subject: [PATCH 1/6] futex: Add ROBUST_LIST_COOKIE for PID namespace agnostic
@@ -65,21 +65,40 @@ The compat variant gets the identical treatment.
 
 Signed-off-by: Keno Fischer <keno@juliahub.com>
 Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+
+squash! futex: Add ROBUST_LIST_COOKIE for PID namespace agnostic robust lists
+
+On a ROBUST_LIST_COOKIE list the exit cleanup handles the pending
+operation before the queued entries: a queued entry can implement the
+lease which keeps the pending cookie allocated (e.g. a registry table
+slot held via a robust futex), and handling it first would release the
+cookie for reuse - and let the pending op's lock be legitimately
+re-acquired under the numerically identical cookie - while the stale
+pending op still carries it. The late pending handling would then mark
+the live owner's lock FUTEX_OWNER_DIED.
+
+The pending entry may already be linked into the list and can be
+requeued by a new owner once the pending op was handled, overwriting
+its ->next link: fetch the successor before handling the pending op and
+make the list walk use the prefetched value.
+
+TID based lists keep the historical entries-then-pending order; a TID
+cannot be reused before the exiting task is reaped.
 ---
- Documentation/locking/robust-futex-ABI.rst | 56 ++++++++++++++
- include/linux/compat.h                     |  8 ++
- include/linux/futex_types.h                |  6 ++
- include/uapi/linux/futex.h                 | 58 +++++++++++++++
- kernel/futex/core.c                        | 86 +++++++++++++++++++---
- kernel/futex/futex.h                       |  9 +++
- kernel/futex/syscalls.c                    | 66 +++++++++++++----
- 7 files changed, 267 insertions(+), 22 deletions(-)
+ Documentation/locking/robust-futex-ABI.rst |  82 ++++++++++
+ include/linux/compat.h                     |   8 +
+ include/linux/futex_types.h                |   6 +
+ include/uapi/linux/futex.h                 |  58 +++++++
+ kernel/futex/core.c                        | 171 +++++++++++++++++++--
+ kernel/futex/futex.h                       |   9 ++
+ kernel/futex/syscalls.c                    |  66 ++++++--
+ 7 files changed, 371 insertions(+), 29 deletions(-)
 
 diff --git a/Documentation/locking/robust-futex-ABI.rst b/Documentation/locking/robust-futex-ABI.rst
-index 5e6a0665b8ba..662f0a693b85 100644
+index 5e6a0665b8ba..5265fdabcd04 100644
 --- a/Documentation/locking/robust-futex-ABI.rst
 +++ b/Documentation/locking/robust-futex-ABI.rst
-@@ -226,3 +226,59 @@ depending on the size of the pointer). If the vDSO call succeeds, it means that
+@@ -226,3 +226,85 @@ depending on the size of the pointer). If the vDSO call succeeds, it means that
  it released the lock and cleared ``list_op_pending``. If it fails, that means
  that there are waiters for this lock and a call to ``futex()`` syscall with
  ``FUTEX_ROBUST_UNLOCK`` is needed.
@@ -127,6 +146,32 @@ index 5e6a0665b8ba..662f0a693b85 100644
 +    (shared) lock, and concurrent lock attempts of different tasks
 +    would overwrite each other's identifiers while their respective
 +    'list_op_pending' is armed.
++
++ 3) The exit time cleanup handles the pending operation *before* the
++    queued entries. A queued entry may implement the lease which keeps
++    the thread's cookie allocated (for instance a registry table slot
++    held via a robust futex); handling the queued entries first would
++    release the cookie for reuse while the stale pending operation
++    still carries it, and a lock legitimately re-acquired under the
++    reused cookie would be marked ``FUTEX_OWNER_DIED`` behind its live
++    owner's back. User space may therefore recycle a cookie as soon as
++    the exit cleanup released its lease, without waiting for the rest
++    of the dead thread's list to be processed. (TID based lists keep
++    the historical entries-then-pending order; a TID cannot be reused
++    before the exiting task is reaped.)
++
++ 4) When the cookie lease is itself a queued robust list entry, user
++    space must order it *after* every lock entry it covers, i.e. the
++    lease entry is enqueued first and later entries are inserted at the
++    head, so the walk reaches the lease last. If the lease were walked
++    while lock entries of the dead thread are still unprocessed, the
++    cookie could be reused and - through a misattributed pending
++    operation of a second dying task - one of those locks could end up
++    re-acquired by a live task before the first walk processes its
++    stale entry, which would then wipe the live owner's lock. Lease
++    types which are released only at process exit (such as OFD file
++    locks, which the kernel drops after all exit time futex cleanup)
++    satisfy this ordering by construction.
 +
 +User space is responsible for assigning cookies which are unique among
 +all tasks which can hold the lock, the same way TIDs are unique among
@@ -255,7 +300,7 @@ index 10a36c551675..8eb64cc91819 100644
   * Are there any waiters for this robust futex:
   */
 diff --git a/kernel/futex/core.c b/kernel/futex/core.c
-index 179b26e9c934..bd50e5969131 100644
+index 179b26e9c934..510a1619b627 100644
 --- a/kernel/futex/core.c
 +++ b/kernel/futex/core.c
 @@ -964,13 +964,17 @@ void futex_unqueue_pi(struct futex_q *q)
@@ -317,11 +362,15 @@ index 179b26e9c934..bd50e5969131 100644
  /*
   * Walk curr->futex.robust_list (very carefully, it's a userspace list!)
   * and mark any locks found there dead, and notify any waiters.
-@@ -1110,9 +1136,26 @@ static void exit_robust_list(struct task_struct *curr)
+@@ -1110,9 +1136,30 @@ static void exit_robust_list(struct task_struct *curr)
  	struct robust_list_head __user *head = curr->futex.robust_list;
  	unsigned int limit = ROBUST_LIST_LIMIT, cur_mod, next_mod, pend_mod;
  	struct robust_list __user *entry, *next_entry, *pending;
 +	bool cookies = curr->futex.robust_list_flags & ROBUST_LIST_COOKIE;
++	struct robust_list __user *pending_next = NULL;
++	unsigned int pending_next_mod = 0;
++	bool pending_handled = false;
++	int pending_next_rc = 0;
 +	long cookie_offset = 0;
  	unsigned long futex_offset;
 +	u32 tid = task_pid_vnr(curr), owner_id, pending_cookie = tid;
@@ -344,7 +393,62 @@ index 179b26e9c934..bd50e5969131 100644
  	/*
  	 * Fetch the list head (which was registered earlier, via
  	 * sys_set_robust_list()):
-@@ -1143,8 +1186,12 @@ static void exit_robust_list(struct task_struct *curr)
+@@ -1131,20 +1178,65 @@ static void exit_robust_list(struct task_struct *curr)
+ 	if (fetch_robust_entry(&pending, &head->list_op_pending, &pend_mod))
+ 		return;
+ 
++	/*
++	 * On a ROBUST_LIST_COOKIE list the pending op must be handled
++	 * before any queued entry: a queued entry can implement the
++	 * lease which keeps the pending cookie allocated to this task
++	 * (e.g. a registry slot held via a robust futex). Handling the
++	 * queued entries first would release that lease while the stale
++	 * pending op still carries the cookie; a new task could then
++	 * legitimately reuse the cookie and acquire the pending op's
++	 * lock, and the late pending handling would mark the live
++	 * owner's lock OWNER_DIED.
++	 *
++	 * The pending entry might already be linked into the list, and
++	 * once the pending op was handled a new owner can acquire the
++	 * lock and requeue the entry on its own list, overwriting its
++	 * ->next link. Therefore fetch the successor before handling
++	 * the pending op; the list walk below uses the prefetched
++	 * successor when it reaches the entry.
++	 *
++	 * TID based lists keep the historical order: TIDs cannot be
++	 * reused before the exiting task is reaped, so the walk order
++	 * does not matter there.
++	 */
++	if (cookies && pending) {
++		pending_next_rc = fetch_robust_entry(&pending_next,
++						     &pending->next,
++						     &pending_next_mod);
++		handle_futex_death((void __user *)pending + futex_offset,
++				   curr, pend_mod, HANDLE_DEATH_PENDING,
++				   pending_cookie);
++		pending_handled = true;
++	}
++
+ 	next_entry = NULL;	/* avoid warning with gcc */
+ 	while (entry != &head->list) {
+ 		/*
+ 		 * Fetch the next entry in the list before calling
+-		 * handle_futex_death:
++		 * handle_futex_death. If this entry is the already
++		 * handled pending op, its ->next may have been
++		 * overwritten by a new owner meanwhile: use the
++		 * successor fetched above instead.
+ 		 */
+-		rc = fetch_robust_entry(&next_entry, &entry->next, &next_mod);
++		if (pending_handled && entry == pending) {
++			rc = pending_next_rc;
++			next_entry = pending_next;
++			next_mod = pending_next_mod;
++		} else {
++			rc = fetch_robust_entry(&next_entry, &entry->next, &next_mod);
++		}
+ 		/*
+ 		 * A pending lock might already be on the list, so
  		 * don't process it twice:
  		 */
  		if (entry != pending) {
@@ -358,9 +462,12 @@ index 179b26e9c934..bd50e5969131 100644
  				return;
  		}
  		if (rc)
-@@ -1162,7 +1209,8 @@ static void exit_robust_list(struct task_struct *curr)
+@@ -1160,9 +1252,10 @@ static void exit_robust_list(struct task_struct *curr)
+ 		cond_resched();
+ 	}
  
- 	if (pending) {
+-	if (pending) {
++	if (pending && !pending_handled) {
  		handle_futex_death((void __user *)pending + futex_offset,
 -				   curr, pend_mod, HANDLE_DEATH_PENDING);
 +				   curr, pend_mod, HANDLE_DEATH_PENDING,
@@ -368,13 +475,18 @@ index 179b26e9c934..bd50e5969131 100644
  	}
  }
  
-@@ -1224,10 +1272,22 @@ static void compat_exit_robust_list(struct task_struct *curr)
+@@ -1224,10 +1317,27 @@ static void compat_exit_robust_list(struct task_struct *curr)
  	struct compat_robust_list_head __user *head = current->futex.compat_robust_list;
  	unsigned int limit = ROBUST_LIST_LIMIT, cur_mod, next_mod, pend_mod;
  	struct robust_list __user *entry, *next_entry, *pending;
 +	bool cookies = curr->futex.compat_robust_list_flags & ROBUST_LIST_COOKIE;
  	compat_uptr_t uentry, next_uentry, upending;
 -	compat_long_t futex_offset;
++	struct robust_list __user *pending_next = NULL;
++	compat_uptr_t pending_next_uentry = 0;
++	unsigned int pending_next_mod = 0;
++	bool pending_handled = false;
++	int pending_next_rc = 0;
 +	compat_long_t futex_offset, cookie_offset = 0;
 +	u32 tid = task_pid_vnr(curr), owner_id, pending_cookie = tid;
  	int rc;
@@ -392,7 +504,46 @@ index 179b26e9c934..bd50e5969131 100644
  	/*
  	 * Fetch the list head (which was registered earlier, via
  	 * sys_set_robust_list()):
-@@ -1261,7 +1321,11 @@ static void compat_exit_robust_list(struct task_struct *curr)
+@@ -1246,14 +1356,35 @@ static void compat_exit_robust_list(struct task_struct *curr)
+ 	if (compat_fetch_robust_entry(&upending, &pending, &head->list_op_pending, &pend_mod))
+ 		return;
+ 
++	/* See the comment in exit_robust_list() */
++	if (cookies && pending) {
++		void __user *uaddr = futex_uaddr(pending, futex_offset);
++
++		pending_next_rc = compat_fetch_robust_entry(&pending_next_uentry,
++				&pending_next,
++				(compat_uptr_t __user *)&pending->next,
++				&pending_next_mod);
++		handle_futex_death(uaddr, curr, pend_mod, HANDLE_DEATH_PENDING,
++				   pending_cookie);
++		pending_handled = true;
++	}
++
+ 	next_entry = NULL;	/* avoid warning with gcc */
+ 	while (entry != (struct robust_list __user *) &head->list) {
+ 		/*
+ 		 * Fetch the next entry in the list before calling
+-		 * handle_futex_death:
++		 * handle_futex_death. See the comment in
++		 * exit_robust_list() about the already handled pending op.
+ 		 */
+-		rc = compat_fetch_robust_entry(&next_uentry, &next_entry,
+-			(compat_uptr_t __user *)&entry->next, &next_mod);
++		if (pending_handled && entry == pending) {
++			rc = pending_next_rc;
++			next_uentry = pending_next_uentry;
++			next_entry = pending_next;
++			next_mod = pending_next_mod;
++		} else {
++			rc = compat_fetch_robust_entry(&next_uentry, &next_entry,
++				(compat_uptr_t __user *)&entry->next, &next_mod);
++		}
+ 		/*
+ 		 * A pending lock might already be on the list, so
+ 		 * dont process it twice:
+@@ -1261,7 +1392,11 @@ static void compat_exit_robust_list(struct task_struct *curr)
  		if (entry != pending) {
  			void __user *uaddr = futex_uaddr(entry, futex_offset);
  
@@ -405,8 +556,12 @@ index 179b26e9c934..bd50e5969131 100644
  				return;
  		}
  		if (rc)
-@@ -1280,7 +1344,8 @@ static void compat_exit_robust_list(struct task_struct *curr)
- 	if (pending) {
+@@ -1277,10 +1412,11 @@ static void compat_exit_robust_list(struct task_struct *curr)
+ 
+ 		cond_resched();
+ 	}
+-	if (pending) {
++	if (pending && !pending_handled) {
  		void __user *uaddr = futex_uaddr(pending, futex_offset);
  
 -		handle_futex_death(uaddr, curr, pend_mod, HANDLE_DEATH_PENDING);
@@ -415,7 +570,7 @@ index 179b26e9c934..bd50e5969131 100644
  	}
  }
  
-@@ -1419,6 +1484,7 @@ void __futex_fixup_robust_unlock(struct pt_regs *regs, struct futex_unlock_cs_ra
+@@ -1419,6 +1555,7 @@ void __futex_fixup_robust_unlock(struct pt_regs *regs, struct futex_unlock_cs_ra
  
  	futex_robust_list_clear_pending(pop, csr->pop_size32 ? FLAGS_ROBUST_LIST32 : 0);
  }
@@ -423,7 +578,7 @@ index 179b26e9c934..bd50e5969131 100644
  #endif /* CONFIG_FUTEX_ROBUST_UNLOCK */
  
  static void futex_cleanup(struct task_struct *tsk)
-@@ -1426,12 +1492,14 @@ static void futex_cleanup(struct task_struct *tsk)
+@@ -1426,12 +1563,14 @@ static void futex_cleanup(struct task_struct *tsk)
  	if (unlikely(tsk->futex.robust_list)) {
  		exit_robust_list(tsk);
  		tsk->futex.robust_list = NULL;

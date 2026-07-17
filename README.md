@@ -110,17 +110,25 @@ cookies for POSIX mutexes without global coordination, is the new part.
 
 ## Verification
 
-- Kernel selftests: 32 futex tests (including a live PID namespace
-  corruption reproducer and its cookie-based fix) and 4 membarrier
-  tests, run under QEMU.
+- Kernel selftests: 36 futex tests (including a live PID namespace
+  corruption reproducer and its cookie-based fix, plus exit-walk
+  ordering tests which demonstrably fail on a kernel without the
+  pending-before-entries cleanup order) and 4 membarrier tests, run
+  under QEMU.
 - `rfmutex` (in `lib/`): mutual exclusion, cross PID namespace and
   SIGKILL stress tests with EOWNERDEAD recovery for all three cookie
-  assignment schemes.
+  assignment schemes, plus lifecycle tests (concurrent first attach,
+  non-owner unlock rejection, fork reset, OFD inode identity across
+  renames, cookie lease release on thread exit, fd 0 handling).
 - TLA+ (in `tla/`, results matrix in `tla/README.md`): the final design
   passes exhaustively (3 threads, full cookie wrap: 3.5e9 states) and
-  the specifications demonstrably catch five distinct broken variants,
-  including the historical TID bug. Model checking found two genuine
-  bugs during development (both fixed in patch 3 of the series).
+  the specifications demonstrably catch seven distinct broken variants,
+  including the historical TID bug and both exit-walk ordering defects.
+  Model checking found three genuine bugs during development: two exit
+  fixup windows (fixed in patch 3) and, during the post-review rework,
+  the requirement that the cookie lease entry is walked last (patch 1's
+  pending-first order plus a documented user space list order
+  obligation).
 - Benchmarks vs. pthread mutexes in `bench/RESULTS.md`.
 
 ## Repository layout

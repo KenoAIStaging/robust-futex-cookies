@@ -1,4 +1,4 @@
-From f7581719221ad6005735e926895c893393812a4d Mon Sep 17 00:00:00 2001
+From a5c6bcc82ab50a7ad0180a46c819da837c24d6e9 Mon Sep 17 00:00:00 2001
 From: Keno Fischer <keno@juliahub.com>
 Date: Thu, 16 Jul 2026 08:22:51 +0000
 Subject: [PATCH 4/6] selftests/futex: Add tests for the VDSO robust cmpxchg
@@ -32,7 +32,7 @@ Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
  1 file changed, 410 insertions(+)
 
 diff --git a/tools/testing/selftests/futex/functional/robust_list.c b/tools/testing/selftests/futex/functional/robust_list.c
-index f4ceab854ca2..3fe6623f8315 100644
+index 120968f140b1..e0c2d30d05a2 100644
 --- a/tools/testing/selftests/futex/functional/robust_list.c
 +++ b/tools/testing/selftests/futex/functional/robust_list.c
 @@ -30,6 +30,7 @@
@@ -51,8 +51,8 @@ index f4ceab854ca2..3fe6623f8315 100644
  #include <sys/wait.h>
  
  #define STACK_SIZE (1024 * 1024)
-@@ -1249,4 +1251,412 @@ TEST(test_pidns_cookie)
- 	pidns_collision_test(_metadata, true);
+@@ -1592,4 +1594,412 @@ TEST(test_pending_fault)
+ 	ksft_test_result_pass("%s\n", __func__);
  }
  
 +/*
