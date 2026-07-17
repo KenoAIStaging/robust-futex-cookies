@@ -26,7 +26,24 @@
 #include <time.h>
 #include <unistd.h>
 
-#define REGION_PATH	"/tmp/rfm_region"
+/*
+ * Per-run region path: isolated by PID so concurrent runs never
+ * interfere and no fixed global name is ever unlinked. RFM_REGION_PATH
+ * overrides it. Workers inherit the resolved value through clone/fork.
+ */
+static char region_path[128];
+#define REGION_PATH region_path
+
+static void region_path_init(void)
+{
+	const char *env = getenv("RFM_REGION_PATH");
+
+	if (env)
+		snprintf(region_path, sizeof(region_path), "%s", env);
+	else
+		snprintf(region_path, sizeof(region_path),
+			 "/tmp/rfm_region.%d", (int)getpid());
+}
 
 struct testarea {
 	rfmutex_t	mtx;
@@ -156,6 +173,44 @@ static pid_t spawn_worker(struct worker_arg *wa)
 	return clone(worker_trampoline, stack + 256 * 1024, flags, wa);
 }
 
+/*
+ * Reap @pid and require a clean exit with status 0. Signal deaths -
+ * which WEXITSTATUS() alone would misread as exit code 0 - and waitpid
+ * failures are reported as failures.
+ */
+static int reap_worker(pid_t pid, const char *what)
+{
+	int wstatus;
+
+	if (waitpid(pid, &wstatus, 0) != pid) {
+		printf("FAIL %s: waitpid: %s\n", what, strerror(errno));
+		return 1;
+	}
+	if (!WIFEXITED(wstatus) || WEXITSTATUS(wstatus)) {
+		printf("FAIL %s: %s %d\n", what,
+		       WIFSIGNALED(wstatus) ? "killed by signal" : "exit status",
+		       WIFSIGNALED(wstatus) ? WTERMSIG(wstatus) : WEXITSTATUS(wstatus));
+		return 1;
+	}
+	return 0;
+}
+
+/* Reap @pid and require death by @sig (the deliberately killed victim) */
+static int reap_killed_worker(pid_t pid, int sig, const char *what)
+{
+	int wstatus;
+
+	if (waitpid(pid, &wstatus, 0) != pid) {
+		printf("FAIL %s: waitpid: %s\n", what, strerror(errno));
+		return 1;
+	}
+	if (!WIFSIGNALED(wstatus) || WTERMSIG(wstatus) != sig) {
+		printf("FAIL %s: unexpected status 0x%x\n", what, wstatus);
+		return 1;
+	}
+	return 0;
+}
+
 static struct testarea *setup(rfm_region_t **rp, enum rfm_type type)
 {
 	rfm_region_t *r;
@@ -182,7 +237,7 @@ static int test_exclusion(enum rfm_type type, enum rfm_alloc alloc, bool pidns,
 	struct testarea *a = setup(&r, type);
 	struct worker_arg wa[16];
 	pid_t pids[16];
-	int failed = 0, wstatus;
+	int failed = 0;
 	uint64_t total;
 
 	if (!a)
@@ -194,12 +249,16 @@ static int test_exclusion(enum rfm_type type, enum rfm_alloc alloc, bool pidns,
 		pids[i] = spawn_worker(&wa[i]);
 		if (pids[i] < 0) {
 			if (pidns && (errno == EPERM || errno == EINVAL)) {
+				/* A real skip: reap and report as such */
 				printf("SKIP %s/%s pidns (no CLONE_NEWPID)\n",
 				       type_name(type), alloc_name(alloc));
 				atomic_store(&a->stop, 1);
-				nworkers = i;
-				goto reap;
+				for (int j = 0; j < i; j++)
+					reap_worker(pids[j], "exclusion worker");
+				rfm_region_detach(r);
+				return 0;
 			}
+			printf("FAIL exclusion: spawn: %s\n", strerror(errno));
 			failed = 1;
 			nworkers = i;
 			goto reap;
@@ -207,13 +266,10 @@ static int test_exclusion(enum rfm_type type, enum rfm_alloc alloc, bool pidns,
 	}
 
 	usleep(duration_ms * 1000);
-	atomic_store(&a->stop, 1);
 reap:
-	for (int i = 0; i < nworkers; i++) {
-		waitpid(pids[i], &wstatus, 0);
-		if (WEXITSTATUS(wstatus))
-			failed = 1;
-	}
+	atomic_store(&a->stop, 1);
+	for (int i = 0; i < nworkers; i++)
+		failed |= reap_worker(pids[i], "exclusion worker");
 	total = atomic_load(&a->count);
 	if (atomic_load(&a->errors) || !total)
 		failed = 1;
@@ -230,14 +286,15 @@ reap:
  * parent SIGKILLs random workers and respawns them. Survivors must make
  * progress, EOWNERDEAD must be observed, no exclusion violations.
  */
-static int test_kill_stress(enum rfm_type type, bool pidns, int nworkers,
-			    int kills, int duration_ms)
+static int test_kill_stress(enum rfm_type type, enum rfm_alloc alloc,
+			    bool pidns, int nworkers, int kills,
+			    int duration_ms)
 {
 	rfm_region_t *r;
 	struct testarea *a = setup(&r, type);
 	struct worker_arg wa[16];
 	pid_t pids[16];
-	int failed = 0, wstatus;
+	int failed = 0;
 	unsigned int seed = 12345;
 
 	if (!a)
@@ -245,9 +302,7 @@ static int test_kill_stress(enum rfm_type type, bool pidns, int nworkers,
 
 	for (int i = 0; i < nworkers; i++) {
 		wa[i] = (struct worker_arg){ .a = a, .idx = i, .hold_every = 64,
-					     .pidns = pidns,
-					     .alloc = type == RFM_TYPE_COUNTER ?
-						      RFM_ALLOC_NONE : RFM_ALLOC_REGISTRY };
+					     .pidns = pidns, .alloc = alloc };
 		pids[i] = spawn_worker(&wa[i]);
 		if (pids[i] < 0) {
 			if (pidns && (errno == EPERM || errno == EINVAL)) {
@@ -255,11 +310,13 @@ static int test_kill_stress(enum rfm_type type, bool pidns, int nworkers,
 				atomic_store(&a->stop, 1);
 				for (int j = 0; j < i; j++) {
 					kill(pids[j], SIGKILL);
-					waitpid(pids[j], &wstatus, 0);
+					reap_killed_worker(pids[j], SIGKILL,
+							   "skip teardown");
 				}
 				rfm_region_detach(r);
 				return 0;
 			}
+			printf("FAIL kill stress: spawn: %s\n", strerror(errno));
 			nworkers = i;
 			failed = 1;
 			goto out;
@@ -271,10 +328,13 @@ static int test_kill_stress(enum rfm_type type, bool pidns, int nworkers,
 		int victim = rand_r(&seed) % nworkers;
 
 		kill(pids[victim], SIGKILL);
-		waitpid(pids[victim], &wstatus, 0);
+		/* Only the deliberate victim may die by signal */
+		failed |= reap_killed_worker(pids[victim], SIGKILL,
+					     "kill stress victim");
 		/* Respawn */
 		pids[victim] = spawn_worker(&wa[victim]);
 		if (pids[victim] < 0) {
+			printf("FAIL kill stress: respawn: %s\n", strerror(errno));
 			failed = 1;
 			break;
 		}
@@ -286,14 +346,18 @@ out:
 	atomic_store(&a->stop, 1);
 	for (int i = 0; i < nworkers; i++) {
 		if (pids[i] > 0)
-			waitpid(pids[i], &wstatus, 0);
+			failed |= reap_worker(pids[i], "kill stress survivor");
 	}
 	if (atomic_load(&a->errors))
 		failed = 1;
 	if (!atomic_load(&a->count))
 		failed = 1;
-	printf("%s %s%s kill stress: %lu iterations, %u errors, %u owner-dead recoveries\n",
-	       failed ? "FAIL" : "OK", type_name(type), pidns ? "/pidns" : "",
+	/* The point of the exercise: dead owners must be recovered from */
+	if (kills > 0 && !atomic_load(&a->owner_dead_seen))
+		failed = 1;
+	printf("%s %s/%s%s kill stress: %lu iterations, %u errors, %u owner-dead recoveries\n",
+	       failed ? "FAIL" : "OK", type_name(type), alloc_name(alloc),
+	       pidns ? "/pidns" : "",
 	       (unsigned long)atomic_load(&a->count), atomic_load(&a->errors),
 	       atomic_load(&a->owner_dead_seen));
 	rfm_region_detach(r);
@@ -310,7 +374,7 @@ static int test_counter_generations(int nworkers, int duration_ms)
 	struct testarea *a = setup(&r, RFM_TYPE_COUNTER);
 	struct worker_arg wa[16];
 	pid_t pids[16];
-	int failed = 0, wstatus;
+	int failed = 0;
 	uint64_t start_gen, end_gen;
 
 	if (!a)
@@ -324,14 +388,18 @@ static int test_counter_generations(int nworkers, int duration_ms)
 		wa[i] = (struct worker_arg){ .a = a, .idx = i,
 					     .alloc = RFM_ALLOC_NONE };
 		pids[i] = spawn_worker(&wa[i]);
+		if (pids[i] < 0) {
+			printf("FAIL counter generations: spawn: %s\n",
+			       strerror(errno));
+			failed = 1;
+			nworkers = i;
+			break;
+		}
 	}
 	usleep(duration_ms * 1000);
 	atomic_store(&a->stop, 1);
-	for (int i = 0; i < nworkers; i++) {
-		waitpid(pids[i], &wstatus, 0);
-		if (WEXITSTATUS(wstatus))
-			failed = 1;
-	}
+	for (int i = 0; i < nworkers; i++)
+		failed |= reap_worker(pids[i], "generation worker");
 	end_gen = atomic_load(&a->mtx.counter) >> 29;
 	if (atomic_load(&a->errors) || end_gen == start_gen)
 		failed = 1;
@@ -371,7 +439,7 @@ static int test_alloc_reuse(enum rfm_alloc alloc)
 	rfm_region_t *r;
 	struct testarea *a = setup(&r, RFM_TYPE_EXPLICIT);
 	struct reuse_arg hold = { alloc, false }, release = { alloc, true };
-	int failed = 0, wstatus;
+	int failed = 0;
 	pid_t pid;
 
 	if (!a)
@@ -381,15 +449,13 @@ static int test_alloc_reuse(enum rfm_alloc alloc)
 	pid = fork();
 	if (!pid)
 		_exit(rfm_run_libcless(reuse_child, &hold));
-	waitpid(pid, &wstatus, 0);
-	failed |= WEXITSTATUS(wstatus);
+	failed |= reap_worker(pid, "alloc reuse child 1");
 
 	/* Child 2 must get cookie 1 again */
 	pid = fork();
 	if (!pid)
 		_exit(rfm_run_libcless(reuse_child, &release));
-	waitpid(pid, &wstatus, 0);
-	failed |= WEXITSTATUS(wstatus);
+	failed |= reap_worker(pid, "alloc reuse child 2");
 
 	printf("%s %s cookie reuse after death\n", failed ? "FAIL" : "OK",
 	       alloc_name(alloc));
@@ -612,7 +678,10 @@ static int test_ofd_identity(void)
 	}
 
 	/* Rename the region file and plant a decoy at the old path */
-	failed |= rename(REGION_PATH, REGION_PATH ".moved") != 0;
+	char moved[160];
+
+	snprintf(moved, sizeof(moved), "%s.moved", REGION_PATH);
+	failed |= rename(REGION_PATH, moved) != 0;
 	fd = open(REGION_PATH, O_RDWR | O_CREAT, 0666);
 	failed |= fd < 0;
 	if (fd >= 0)
@@ -626,7 +695,7 @@ static int test_ofd_identity(void)
 	printf("%s ofd inode identity after rename (second cookie %ld)\n",
 	       failed ? "FAIL" : "OK", (long)tcookie);
 	unlink(REGION_PATH);
-	unlink(REGION_PATH ".moved");
+	unlink(moved);
 	rfm_thread_detach(r);
 	rfm_region_detach(r);
 	return failed;
@@ -711,10 +780,182 @@ static int test_ofd_fd0(void)
 	return failed;
 }
 
+/*
+ * Self check: the reap helper must detect a crashed worker. The child
+ * dies by SIGABRT; reap_worker() reporting a failure is the pass
+ * condition (a suite which cannot fail proves nothing).
+ */
+static int test_selfcheck_crash_detection(void)
+{
+	int detected;
+	pid_t pid = fork();
+
+	if (!pid) {
+		signal(SIGABRT, SIG_DFL);
+		abort();
+	}
+	/* Expected to print a FAIL line for the crashed child: */
+	detected = reap_worker(pid, "selfcheck victim (expected)");
+	printf("%s crash detection self check\n", detected ? "OK" : "FAIL");
+	return !detected;
+}
+
+/*
+ * Only the recovering owner may clear the inconsistency marker.
+ */
+struct consistent_arg {
+	rfm_region_t	*r;
+	rfmutex_t	*mtx;
+	enum rfm_alloc	alloc;
+};
+
+static void *consistent_nonowner_fn(void *p)
+{
+	struct consistent_arg *ca = p;
+
+	if (rfm_thread_attach(ca->r, ca->alloc))
+		return (void *)1L;
+	if (rfm_mutex_consistent(ca->mtx) != -EPERM)
+		return (void *)2L;
+	rfm_thread_detach(ca->r);
+	return NULL;
+}
+
+static int test_consistent_owner(enum rfm_type type, enum rfm_alloc alloc)
+{
+	rfm_region_t *r;
+	struct testarea *a = setup(&r, type);
+	struct consistent_arg ca;
+	int failed = 0;
+	pthread_t th;
+	void *tret;
+	pid_t pid;
+
+	if (!a)
+		return 1;
+	if (rfm_thread_attach(r, alloc)) {
+		rfm_region_detach(r);
+		return 1;
+	}
+
+	/* An owner which did not inherit a dead owner's lock */
+	failed |= rfm_mutex_lock(&a->mtx) != 0;
+	failed |= rfm_mutex_consistent(&a->mtx) != -EINVAL;
+	failed |= rfm_mutex_unlock(&a->mtx) != 0;
+
+	/* Produce an inconsistent mutex: child dies while holding it */
+	pid = fork();
+	if (!pid) {
+		if (rfm_thread_attach(r, alloc))
+			_exit(1);
+		if (rfm_mutex_lock(&a->mtx))
+			_exit(2);
+		kill(getpid(), SIGKILL);
+		_exit(3);
+	}
+	failed |= reap_killed_worker(pid, SIGKILL, "consistent victim");
+
+	/* Recovering owner */
+	failed |= rfm_mutex_lock(&a->mtx) != EOWNERDEAD;
+
+	/* A non owner must not clear the marker */
+	ca = (struct consistent_arg){ .r = r, .mtx = &a->mtx, .alloc = alloc };
+	pthread_create(&th, NULL, consistent_nonowner_fn, &ca);
+	pthread_join(th, &tret);
+	failed |= (tret != NULL);
+	failed |= !(atomic_load(&a->mtx.word) & 0x40000000U);
+
+	/* The recovering owner succeeds exactly once */
+	failed |= rfm_mutex_consistent(&a->mtx) != 0;
+	failed |= rfm_mutex_consistent(&a->mtx) != -EINVAL;
+	failed |= rfm_mutex_unlock(&a->mtx) != 0;
+
+	printf("%s %s/%s consistent() ownership\n", failed ? "FAIL" : "OK",
+	       type_name(type), alloc_name(alloc));
+	rfm_thread_detach(r);
+	rfm_region_detach(r);
+	return failed;
+}
+
+/*
+ * Region file validation: malformed inputs must fail cleanly.
+ */
+static int test_region_validation(void)
+{
+	rfm_region_t *r;
+	int failed = 0, fd;
+	char path[160];
+
+	snprintf(path, sizeof(path), "%s.val", REGION_PATH);
+
+	unlink(path);
+
+	/* Create on an existing path must fail (exclusive create) */
+	r = rfm_region_create(path, 4096);
+	failed |= (r == NULL);
+	if (r)
+		rfm_region_detach(r);
+	errno = 0;
+	r = rfm_region_create(path, 4096);
+	failed |= (r != NULL || errno != EEXIST);
+
+	/* Size overflow */
+	unlink(path);
+	errno = 0;
+	r = rfm_region_create(path, SIZE_MAX - 16);
+	failed |= (r != NULL);
+
+	/* Attaching a short file must fail, not SIGBUS later */
+	unlink(path);
+	fd = open(path, O_RDWR | O_CREAT, 0666);
+	failed |= (fd < 0) || ftruncate(fd, 64) != 0;
+	close(fd);
+	failed |= (rfm_region_attach(path) != NULL);
+
+	/* Bad magic */
+	unlink(path);
+	r = rfm_region_create(path, 4096);
+	failed |= (r == NULL);
+	if (r)
+		rfm_region_detach(r);
+	fd = open(path, O_RDWR, 0);
+	if (fd >= 0) {
+		uint32_t zero = 0;
+		/* corrupt the magic (first header field) */
+		failed |= pwrite(fd, &zero, sizeof(zero), 0) != sizeof(zero);
+		close(fd);
+	}
+	failed |= (rfm_region_attach(path) != NULL);
+
+	/* Out of bounds nslots */
+	unlink(path);
+	r = rfm_region_create(path, 4096);
+	failed |= (r == NULL);
+	if (r)
+		rfm_region_detach(r);
+	fd = open(path, O_RDWR, 0);
+	if (fd >= 0) {
+		uint32_t huge = 1 << 20;
+		/* nslots is the second header field */
+		failed |= pwrite(fd, &huge, sizeof(huge), 4) != sizeof(huge);
+		close(fd);
+	}
+	failed |= (rfm_region_attach(path) != NULL);
+
+	unlink(path);
+	printf("%s region validation\n", failed ? "FAIL" : "OK");
+	return failed;
+}
+
 int main(int argc, char **argv)
 {
+	region_path_init();
+
 	int failed = 0;
 	int dur = argc > 1 ? atoi(argv[1]) : 400;
+
+	failed |= test_selfcheck_crash_detection();
+	failed |= test_region_validation();
 
 	/* Must be first: races the process wide one-time initialization */
 	failed |= test_attach_race();
@@ -729,10 +970,11 @@ int main(int argc, char **argv)
 	failed |= test_exclusion(RFM_TYPE_COUNTER, RFM_ALLOC_NONE, false, 4, dur);
 	failed |= test_exclusion(RFM_TYPE_COUNTER, RFM_ALLOC_NONE, true, 4, dur);
 
-	failed |= test_kill_stress(RFM_TYPE_EXPLICIT, false, 4, 20, 4 * dur);
-	failed |= test_kill_stress(RFM_TYPE_EXPLICIT, true, 4, 20, 4 * dur);
-	failed |= test_kill_stress(RFM_TYPE_COUNTER, false, 4, 20, 4 * dur);
-	failed |= test_kill_stress(RFM_TYPE_COUNTER, true, 4, 20, 4 * dur);
+	failed |= test_kill_stress(RFM_TYPE_EXPLICIT, RFM_ALLOC_REGISTRY, false, 4, 20, 4 * dur);
+	failed |= test_kill_stress(RFM_TYPE_EXPLICIT, RFM_ALLOC_REGISTRY, true, 4, 20, 4 * dur);
+	failed |= test_kill_stress(RFM_TYPE_EXPLICIT, RFM_ALLOC_OFD, false, 4, 20, 4 * dur);
+	failed |= test_kill_stress(RFM_TYPE_COUNTER, RFM_ALLOC_NONE, false, 4, 20, 4 * dur);
+	failed |= test_kill_stress(RFM_TYPE_COUNTER, RFM_ALLOC_NONE, true, 4, 20, 4 * dur);
 
 	failed |= test_counter_generations(4, 2 * dur);
 
@@ -743,6 +985,8 @@ int main(int argc, char **argv)
 	failed |= test_thread_churn(RFM_ALLOC_REGISTRY);
 	failed |= test_thread_churn(RFM_ALLOC_OFD);
 	failed |= test_ofd_fd0();
+	failed |= test_consistent_owner(RFM_TYPE_EXPLICIT, RFM_ALLOC_REGISTRY);
+	failed |= test_consistent_owner(RFM_TYPE_COUNTER, RFM_ALLOC_NONE);
 
 	printf("%s\n", failed ? "TEST SUITE FAILED" : "ALL TESTS PASSED");
 	return failed;

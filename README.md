@@ -164,36 +164,36 @@ cookies for POSIX mutexes without global coordination, is the new part.
 
 The patches in `patches/` apply with `git am` onto mainline commit
 58717b2a1365 (post 7.2-rc4, containing the FUTEX_ROBUST_UNLOCK work).
-The commands below assume the kernel tree lives in `/workspace` with an
-out-of-tree build directory `.kbuild`.
+
+The checked-in driver runs every validation group with explicit
+expected outcomes (including the TLA+ configurations which *must*
+produce counterexamples) and records a provenance manifest
+(`validate-manifest.txt`, tool versions and artifact hashes):
+
+    KSRC=/path/to/kernel-tree KBUILD=/path/to/kernel-build ./validate.sh
+    ./validate.sh --exhaustive     # adds the multi-hour MCCounterOK10 run
+    ./validate.sh --skip-kernel-build
+
+Individual pieces (all paths overridable, see each script's header):
 
     # kernel
-    cd /workspace/.kbuild && make HOSTCC=/usr/bin/gcc -j100
+    make -C "$KBUILD" HOSTCC=gcc -j"$(nproc)"
 
-    # selftests (Debian toolchain; BB2's glibc is too old)
-    cd /workspace/tools/testing/selftests/futex/functional
-    env PATH=/usr/bin:/bin:/opt/bb2-tools/bin CC=gcc make \
-        KHDR_INCLUDES=-I/workspace/.kbuild/usr/include \
-        LDLIBS="-lpthread -ldl -lrt" robust_list
-    cd /workspace/tools/testing/selftests/membarrier
-    env PATH=/usr/bin:/bin:/opt/bb2-tools/bin CC=gcc make \
-        KHDR_INCLUDES=-I/workspace/.kbuild/usr/include
+    # selftests
+    make -C "$KSRC/tools/testing/selftests/futex/functional" CC=gcc \
+        KHDR_INCLUDES=-I"$KBUILD/usr/include" LDLIBS="-lpthread -ldl -lrt" robust_list
+    make -C "$KSRC/tools/testing/selftests/membarrier" CC=gcc \
+        KHDR_INCLUDES=-I"$KBUILD/usr/include"
 
     # library tests + benchmarks
-    cd /workspace/robust-futex-work/lib && make
+    make -C lib CC=gcc KHDR="$KBUILD/usr/include"
 
-    # run everything in QEMU
-    cd /workspace/robust-futex-work
-    cat > /tmp/run.sh <<'EOF'
-    #!/bin/sh
-    cd /tests
-    ./robust_list || exit 1
-    ./membarrier_shared_rseq_test || exit 1
-    ./test_rfmutex 300 || exit 1
-    EOF
-    ./harness/mkinitramfs.sh /tmp/run.sh /tmp/robust_list \
-        /tmp/membarrier_shared_rseq_test /tmp/test_rfmutex
-    ./harness/runqemu.sh -c 8 -t 600
+    # QEMU run with the checked-in runner
+    ./harness/mkinitramfs.sh initramfs/run-all.sh \
+        "$KSRC/tools/testing/selftests/futex/functional/robust_list" \
+        "$KSRC/tools/testing/selftests/membarrier/membarrier_shared_rseq_test" \
+        lib/test_rfmutex
+    ./harness/runqemu.sh -c "$(nproc)" -t 900 -k "$KBUILD/arch/x86/boot/bzImage"
 
-    # model checking
-    cd tla && java -cp tla2tools.jar tlc2.TLC -workers 32 -deadlock MCExplicitOK
+    # model checking (single configuration)
+    cd tla && java -cp tla2tools.jar tlc2.TLC -workers "$(nproc)" -deadlock MCExplicitOK

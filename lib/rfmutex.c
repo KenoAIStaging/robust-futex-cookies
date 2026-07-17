@@ -2,6 +2,16 @@
 #define _GNU_SOURCE
 #include "rfmutex.h"
 
+/*
+ * Reference implementation for x86-64 Linux only: the glibc rseq
+ * fallback reads the thread pointer via %fs, the vDSO lookup requests
+ * the 64-bit entry points, and the RSEQ guard descriptor layout is
+ * only validated for this ABI.
+ */
+#if !defined(__x86_64__) || !defined(__linux__)
+#error "rfmutex is a reference implementation for x86-64 Linux only"
+#endif
+
 #include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -10,6 +20,7 @@
 #include <pthread.h>
 #include <sched.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -31,6 +42,42 @@ struct robust_list_head2 {
 };
 #define ROBUST_LIST_COOKIE	(0x1UL)
 #endif
+
+/*
+ * Library owned, layout compatible representation of the kernel's
+ * struct robust_list_head2: every forward link which the library
+ * mutates while the kernel may concurrently read it is *declared* with
+ * the one atomic type it is accessed through, instead of casting a
+ * plain pointer object to an atomic type (which the C object model
+ * does not define). The kernel only ever sees the address of this
+ * structure through the registration syscall.
+ */
+struct rfm_list_head {
+	_Atomic(uintptr_t)	list_next;
+	long			futex_offset;
+	_Atomic(uintptr_t)	list_op_pending;
+	unsigned long		flags;
+	long			cookie_offset;
+	uint32_t		list_op_pending_cookie;
+	uint32_t		__reserved;
+};
+
+#define RFM_ASSERT_FIELD(af, kf)					\
+	_Static_assert(offsetof(struct rfm_list_head, af) ==		\
+		       offsetof(struct robust_list_head2, kf) &&	\
+		       sizeof(((struct rfm_list_head *)0)->af) ==	\
+		       sizeof(((struct robust_list_head2 *)0)->kf),	\
+		       "rfm_list_head layout mismatch")
+
+RFM_ASSERT_FIELD(list_next, head.list.next);
+RFM_ASSERT_FIELD(futex_offset, head.futex_offset);
+RFM_ASSERT_FIELD(list_op_pending, head.list_op_pending);
+RFM_ASSERT_FIELD(flags, flags);
+RFM_ASSERT_FIELD(cookie_offset, cookie_offset);
+RFM_ASSERT_FIELD(list_op_pending_cookie, list_op_pending_cookie);
+RFM_ASSERT_FIELD(__reserved, __reserved);
+_Static_assert(sizeof(struct rfm_list_head) == sizeof(struct robust_list_head2),
+	       "rfm_list_head size mismatch");
 
 #ifndef MEMBARRIER_CMD_SHARED_EXPEDITED_RSEQ
 #define MEMBARRIER_CMD_SHARED_EXPEDITED_RSEQ		(1 << 10)
@@ -101,8 +148,8 @@ extern __attribute__((weak)) ptrdiff_t __rseq_offset;
 extern __attribute__((weak)) unsigned int __rseq_size;
 
 typedef uint32_t (*vdso_try_unlock_t)(_Atomic(uint32_t) *lock, uint32_t tid,
-				      struct robust_list **pop);
-typedef uint32_t (*vdso_cmpxchg_rseq_t)(struct robust_list **pending_ptr, uint64_t pending,
+				      void *pop);
+typedef uint32_t (*vdso_cmpxchg_rseq_t)(void *pending_ptr, uint64_t pending,
 					_Atomic(uint32_t) *lock, uint32_t expect,
 					uint32_t set, volatile struct rseq_area *rseq);
 
@@ -151,7 +198,7 @@ static void vdso_resolve(void)
  * Per thread state
  */
 struct rfm_tls {
-	struct robust_list_head2 h;
+	struct rfm_list_head h;
 	volatile struct rseq_area *rseq;
 	struct rseq_area own_rseq;
 	uint32_t cookie;	/* explicit mode thread cookie, 0 if none */
@@ -270,14 +317,15 @@ static int rfm_thread_init_common(void)
 
 	/* Robust list head with cookie support */
 	memset(&t->h, 0, sizeof(t->h));
-	t->h.head.list.next = (struct robust_list *)&t->h.head.list;
-	t->h.head.futex_offset = (ssize_t)offsetof(rfmutex_t, word) -
-				 (ssize_t)offsetof(rfmutex_t, next);
-	t->h.head.list_op_pending = NULL;
+	atomic_store_explicit(&t->h.list_next, (uintptr_t)&t->h.list_next,
+			      memory_order_relaxed);
+	t->h.futex_offset = (ssize_t)offsetof(rfmutex_t, word) -
+			    (ssize_t)offsetof(rfmutex_t, next);
+	atomic_store_explicit(&t->h.list_op_pending, 0, memory_order_relaxed);
 	t->h.flags = ROBUST_LIST_COOKIE;
 	t->h.cookie_offset = (ssize_t)offsetof(rfmutex_t, cookie) -
 			     (ssize_t)offsetof(rfmutex_t, next);
-	if (sys_set_robust_list2(&t->h))
+	if (sys_set_robust_list2((struct robust_list_head2 *)&t->h))
 		return -errno;
 
 	/* membarrier registration (needed for RFM_TYPE_COUNTER quiescence) */
@@ -296,24 +344,30 @@ static int rfm_thread_init_common(void)
  */
 static void rfm_enqueue(struct rfm_tls *t, rfmutex_t *m)
 {
-	uintptr_t head = (uintptr_t)&t->h.head.list;
-	uintptr_t first = (uintptr_t)t->h.head.list.next;
+	uintptr_t head = (uintptr_t)&t->h.list_next;
+	uintptr_t first = atomic_load_explicit(&t->h.list_next,
+					       memory_order_relaxed);
 
 	atomic_store_explicit(&m->next, first, memory_order_relaxed);
 	m->prev = head;
 	if (first != head)
 		rfm_from_entry(first)->prev = (uintptr_t)rfm_entry(m);
 	/* Publish */
-	atomic_store_explicit((_Atomic(uintptr_t) *)&t->h.head.list.next,
-			      (uintptr_t)rfm_entry(m), memory_order_release);
+	atomic_store_explicit(&t->h.list_next, (uintptr_t)rfm_entry(m),
+			      memory_order_release);
 }
 
 static void rfm_dequeue(struct rfm_tls *t, rfmutex_t *m)
 {
-	uintptr_t head = (uintptr_t)&t->h.head.list;
+	uintptr_t head = (uintptr_t)&t->h.list_next;
 	uintptr_t next = atomic_load_explicit(&m->next, memory_order_relaxed);
 
-	/* Unlink: the predecessor's forward link skips this entry */
+	/*
+	 * Unlink: the predecessor's forward link skips this entry. The
+	 * predecessor link is either the head's list_next or another
+	 * entry's next member - both are _Atomic(uintptr_t) objects, so
+	 * the access type always matches the declared type.
+	 */
 	atomic_store_explicit((_Atomic(uintptr_t) *)m->prev, next,
 			      memory_order_release);
 	if (next != head)
@@ -333,7 +387,7 @@ static void rfm_wake_all_robust(struct rfm_tls *t, rfmutex_t *m)
 {
 	/* Unlock (store 0), clear pending op and wake one waiter */
 	sys_futex(&m->word, FUTEX_WAKE | FUTEX_ROBUST_UNLOCK, 1, NULL,
-		  &t->h.head.list_op_pending, 0);
+		  &t->h.list_op_pending, 0);
 }
 
 /*
@@ -378,7 +432,8 @@ static int rfm_lock_explicit(rfmutex_t *m, bool try_only)
 
 	t->h.list_op_pending_cookie = c;
 	atomic_signal_fence(memory_order_seq_cst);
-	t->h.head.list_op_pending = (struct robust_list *)rfm_entry(m);
+	atomic_store_explicit(&t->h.list_op_pending, (uintptr_t)rfm_entry(m),
+			      memory_order_relaxed);
 	atomic_signal_fence(memory_order_seq_cst);
 
 	for (;;) {
@@ -400,7 +455,7 @@ static int rfm_lock_explicit(rfmutex_t *m, bool try_only)
 		}
 
 		if (try_only) {
-			t->h.head.list_op_pending = NULL;
+			atomic_store_explicit(&t->h.list_op_pending, 0, memory_order_relaxed);
 			return EBUSY;
 		}
 		rfm_wait_free(m);
@@ -410,7 +465,7 @@ static int rfm_lock_explicit(rfmutex_t *m, bool try_only)
 	atomic_store_explicit(&m->cookie, c, memory_order_relaxed);
 	rfm_enqueue(t, m);
 	atomic_signal_fence(memory_order_seq_cst);
-	t->h.head.list_op_pending = NULL;
+	atomic_store_explicit(&t->h.list_op_pending, 0, memory_order_relaxed);
 	return dead ? EOWNERDEAD : 0;
 }
 
@@ -510,7 +565,7 @@ static int rfm_lock_counter(rfmutex_t *m, bool try_only)
 		t->h.list_op_pending_cookie = c;
 		atomic_signal_fence(memory_order_seq_cst);
 
-		if (vdso.cmpxchg_rseq(&t->h.head.list_op_pending,
+		if (vdso.cmpxchg_rseq(&t->h.list_op_pending,
 				      (uint64_t)(uintptr_t)rfm_entry(m),
 				      &m->word, w, set, t->rseq)) {
 			atomic_store_explicit(&t->rseq->rseq_cs, 0,
@@ -524,7 +579,7 @@ static int rfm_lock_counter(rfmutex_t *m, bool try_only)
 	atomic_store_explicit(&m->cookie, c, memory_order_relaxed);
 	rfm_enqueue(t, m);
 	atomic_signal_fence(memory_order_seq_cst);
-	t->h.head.list_op_pending = NULL;
+	atomic_store_explicit(&t->h.list_op_pending, 0, memory_order_relaxed);
 	return dead ? EOWNERDEAD : 0;
 }
 
@@ -537,7 +592,8 @@ static int rfm_unlock_common(rfmutex_t *m, uint32_t c)
 
 	t->h.list_op_pending_cookie = c;
 	atomic_signal_fence(memory_order_seq_cst);
-	t->h.head.list_op_pending = (struct robust_list *)rfm_entry(m);
+	atomic_store_explicit(&t->h.list_op_pending, (uintptr_t)rfm_entry(m),
+			      memory_order_relaxed);
 	atomic_signal_fence(memory_order_seq_cst);
 
 	rfm_dequeue(t, m);
@@ -546,7 +602,7 @@ static int rfm_unlock_common(rfmutex_t *m, uint32_t c)
 	 * Fast path: uncontended, consistent lock word. The vDSO helper
 	 * clears the pending op atomically with a successful cmpxchg.
 	 */
-	if (vdso.try_unlock(&m->word, c, &t->h.head.list_op_pending) != c) {
+	if (vdso.try_unlock(&m->word, c, &t->h.list_op_pending) != c) {
 		/* Contended or OWNER_DIED set: kernel unlock + wake */
 		rfm_wake_all_robust(t, m);
 	}
@@ -586,8 +642,8 @@ int rfm_mutex_trylock(rfmutex_t *m)
  */
 static bool rfm_owns(struct rfm_tls *t, rfmutex_t *m)
 {
-	uintptr_t head = (uintptr_t)&t->h.head.list;
-	uintptr_t e = (uintptr_t)t->h.head.list.next;
+	uintptr_t head = (uintptr_t)&t->h.list_next;
+	uintptr_t e = atomic_load_explicit(&t->h.list_next, memory_order_relaxed);
 
 	if (!t->attached)
 		return false;
@@ -627,7 +683,23 @@ int rfm_mutex_unlock(rfmutex_t *m)
 
 int rfm_mutex_consistent(rfmutex_t *m)
 {
+	struct rfm_tls *t = &rfm_tls;
 	uint32_t w = atomic_load_explicit(&m->word, memory_order_relaxed);
+
+	/*
+	 * Only the owner which acquired the mutex (with EOWNERDEAD) may
+	 * clear the inconsistency marker: an unrelated caller erasing it
+	 * while the recovering owner is still repairing state would make
+	 * the next owner miss the indication. Ownership is authenticated
+	 * like in rfm_mutex_unlock().
+	 */
+	if (m->type == RFM_TYPE_COUNTER) {
+		if (!rfm_owns(t, m))
+			return -EPERM;
+	} else {
+		if (!t->cookie || (w & RFM_TID_MASK) != t->cookie)
+			return -EPERM;
+	}
 
 	for (;;) {
 		if (!(w & RFM_OWNER_DIED))
@@ -653,6 +725,7 @@ struct rfm_region_hdr {
 struct rfm_region {
 	struct rfm_region_hdr *hdr;
 	size_t size;
+	uint32_t nslots;	/* validated, stabilized copy of hdr->nslots */
 	/*
 	 * The backing file, kept open for the lifetime of the region.
 	 * OFD cookie allocation takes its byte range locks on fresh open
@@ -665,28 +738,37 @@ struct rfm_region {
 	int fd;
 };
 
+/*
+ * Exclusive create: fails (EEXIST) if @path already exists, so a create
+ * can never silently destroy an existing region.
+ */
 rfm_region_t *rfm_region_create(const char *path, size_t size)
 {
 	rfm_region_t *r;
 	int fd;
 
-	size += sizeof(struct rfm_region_hdr);
-	fd = open(path, O_RDWR | O_CREAT | O_CLOEXEC, 0666);
-	if (fd < 0)
-		return NULL;
-	if (ftruncate(fd, size)) {
-		close(fd);
+	if (size > SIZE_MAX - sizeof(struct rfm_region_hdr)) {
+		errno = EOVERFLOW;
 		return NULL;
 	}
+	size += sizeof(struct rfm_region_hdr);
+
+	fd = open(path, O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0666);
+	if (fd < 0)
+		return NULL;
+	if (ftruncate(fd, size))
+		goto fail_fd;
 
 	r = calloc(1, sizeof(*r));
+	if (!r)
+		goto fail_fd;
 	r->size = size;
+	r->nslots = RFM_REGISTRY_SLOTS;
 	r->fd = fd;
 	r->hdr = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
 	if (r->hdr == MAP_FAILED) {
-		close(fd);
 		free(r);
-		return NULL;
+		goto fail_fd;
 	}
 
 	memset(r->hdr, 0, sizeof(struct rfm_region_hdr));
@@ -696,32 +778,60 @@ rfm_region_t *rfm_region_create(const char *path, size_t size)
 	atomic_thread_fence(memory_order_seq_cst);
 	r->hdr->magic = RFM_MAGIC;
 	return r;
+
+fail_fd:
+	close(fd);
+	return NULL;
 }
 
 rfm_region_t *rfm_region_attach(const char *path)
 {
 	rfm_region_t *r;
 	struct stat st;
+	uint32_t nslots;
 	int fd;
 
 	fd = open(path, O_RDWR | O_CLOEXEC, 0);
 	if (fd < 0)
 		return NULL;
-	if (fstat(fd, &st)) {
-		close(fd);
-		return NULL;
-	}
+	/*
+	 * A complete header must exist before anything is mapped or
+	 * read: a short file would SIGBUS on access and make
+	 * rfm_region_size() underflow.
+	 */
+	if (fstat(fd, &st) || !S_ISREG(st.st_mode) ||
+	    st.st_size < (off_t)sizeof(struct rfm_region_hdr))
+		goto fail_fd;
 
 	r = calloc(1, sizeof(*r));
+	if (!r)
+		goto fail_fd;
 	r->size = st.st_size;
 	r->fd = fd;
 	r->hdr = mmap(NULL, r->size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-	if (r->hdr == MAP_FAILED || r->hdr->magic != RFM_MAGIC) {
-		close(fd);
+	if (r->hdr == MAP_FAILED) {
 		free(r);
-		return NULL;
+		goto fail_fd;
 	}
+
+	/*
+	 * Validate and stabilize the shared metadata: the slot count is
+	 * read once and bounds checked against the fixed slot array, so
+	 * neither corruption nor concurrent modification can drive the
+	 * allocator out of bounds.
+	 */
+	nslots = r->hdr->nslots;
+	if (r->hdr->magic != RFM_MAGIC || nslots > RFM_REGISTRY_SLOTS) {
+		munmap(r->hdr, r->size);
+		free(r);
+		goto fail_fd;
+	}
+	r->nslots = nslots;
 	return r;
+
+fail_fd:
+	close(fd);
+	return NULL;
 }
 
 void *rfm_region_base(rfm_region_t *r)
@@ -767,7 +877,7 @@ static int rfm_alloc_registry(rfm_region_t *r)
 	if (rfm_holds_locks(t))
 		return -EBUSY;
 
-	for (uint32_t k = 0; k < r->hdr->nslots; k++) {
+	for (uint32_t k = 0; k < r->nslots; k++) {
 		rfmutex_t *s = &r->hdr->slots[k];
 		uint32_t c = k + 1;
 		uint32_t w = atomic_load_explicit(&s->word, memory_order_relaxed);
@@ -781,7 +891,8 @@ static int rfm_alloc_registry(rfm_region_t *r)
 		 */
 		t->h.list_op_pending_cookie = c;
 		atomic_signal_fence(memory_order_seq_cst);
-		t->h.head.list_op_pending = (struct robust_list *)rfm_entry(s);
+		atomic_store_explicit(&t->h.list_op_pending, (uintptr_t)rfm_entry(s),
+			      memory_order_relaxed);
 		atomic_signal_fence(memory_order_seq_cst);
 
 		if (atomic_compare_exchange_strong_explicit(&s->word, &w, c,
@@ -789,12 +900,12 @@ static int rfm_alloc_registry(rfm_region_t *r)
 			atomic_store_explicit(&s->cookie, c, memory_order_relaxed);
 			rfm_enqueue(t, s);
 			atomic_signal_fence(memory_order_seq_cst);
-			t->h.head.list_op_pending = NULL;
+			atomic_store_explicit(&t->h.list_op_pending, 0, memory_order_relaxed);
 			t->slot = s;
 			t->cookie = c;
 			return 0;
 		}
-		t->h.head.list_op_pending = NULL;
+		atomic_store_explicit(&t->h.list_op_pending, 0, memory_order_relaxed);
 		k--;	/* lost the race for this slot, retry it */
 	}
 	return -EAGAIN;
@@ -865,8 +976,8 @@ int rfm_thread_attach(rfm_region_t *r, enum rfm_alloc alloc)
 /* Any entry on the thread's robust list other than its registry slot */
 static bool rfm_holds_locks(struct rfm_tls *t)
 {
-	uintptr_t head = (uintptr_t)&t->h.head.list;
-	uintptr_t e = (uintptr_t)t->h.head.list.next;
+	uintptr_t head = (uintptr_t)&t->h.list_next;
+	uintptr_t e = atomic_load_explicit(&t->h.list_next, memory_order_relaxed);
 
 	for (; e && e != head;
 	     e = atomic_load_explicit(&rfm_from_entry(e)->next,

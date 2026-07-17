@@ -36,9 +36,23 @@
 #ifndef RFMUTEX_H
 #define RFMUTEX_H
 
-#include <stdatomic.h>
 #include <stddef.h>
 #include <stdint.h>
+
+/*
+ * The reference implementation itself is x86-64 Linux C11 only (see
+ * rfmutex.c), but the header is consumable from C++: std::atomic<T> is
+ * used in place of C11 _Atomic(T); both are required to be layout
+ * compatible on supported implementations and this is verified with
+ * static assertions below.
+ */
+#ifdef __cplusplus
+#include <atomic>
+#define RFM_ATOMIC(T)	std::atomic<T>
+#else
+#include <stdatomic.h>
+#define RFM_ATOMIC(T)	_Atomic(T)
+#endif
 
 #ifdef __cplusplus
 extern "C" {
@@ -56,15 +70,25 @@ enum rfm_alloc {
 };
 
 typedef struct rfmutex {
-	_Atomic(uint32_t)	word;		/* futex word */
+	RFM_ATOMIC(uint32_t)	word;		/* futex word */
 	uint32_t		type;
-	_Atomic(uint64_t)	counter;	/* cookie reservation counter */
-	_Atomic(uint64_t)	q_gen;		/* highest quiesced generation */
-	_Atomic(uintptr_t)	next;		/* robust list entry (kernel ABI) */
+	RFM_ATOMIC(uint64_t)	counter;	/* cookie reservation counter */
+	RFM_ATOMIC(uint64_t)	q_gen;		/* highest quiesced generation */
+	RFM_ATOMIC(uintptr_t)	next;		/* robust list entry (kernel ABI) */
 	uintptr_t		prev;		/* library private list backlink */
-	_Atomic(uint32_t)	cookie;		/* entry cookie (kernel ABI) */
+	RFM_ATOMIC(uint32_t)	cookie;		/* entry cookie (kernel ABI) */
 	uint32_t		__pad;
 } rfmutex_t;
+
+#ifdef __cplusplus
+static_assert(sizeof(std::atomic<uint32_t>) == sizeof(uint32_t) &&
+	      sizeof(std::atomic<uint64_t>) == sizeof(uint64_t) &&
+	      sizeof(std::atomic<uintptr_t>) == sizeof(uintptr_t) &&
+	      alignof(std::atomic<uint64_t>) == alignof(uint64_t),
+	      "std::atomic is not layout compatible on this implementation");
+static_assert(std::atomic<uint64_t>::is_always_lock_free,
+	      "std::atomic must be lock free for the shared memory ABI");
+#endif
 
 /*
  * A shared memory region with a registry header. Mutexes live anywhere
