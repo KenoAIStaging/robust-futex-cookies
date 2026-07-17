@@ -104,6 +104,16 @@ uint32_t rfm_thread_cookie(void);	/* explicit cookie of this thread, 0 if none *
  */
 int rfm_run_libcless(int (*fn)(void *), void *arg);
 
+/*
+ * A thread exiting without rfm_thread_detach() releases its cookie
+ * lease through a TSD destructor. After fork() the child's inherited
+ * attachment is reset automatically (pthread_atfork) and the child must
+ * rfm_thread_attach() again before using any rfmutex; children created
+ * with a raw clone() must call rfm_thread_reset_after_fork() themselves
+ * first.
+ */
+void rfm_thread_reset_after_fork(void);
+
 /* Mutex API. Returns 0, EOWNERDEAD (lock acquired, previous owner died),
  * EBUSY (trylock only) or a negative errno on hard failure. */
 int rfm_mutex_init(rfmutex_t *m, enum rfm_type type);

@@ -12,6 +12,8 @@
 #include "rfmutex.h"
 
 #include <errno.h>
+#include <fcntl.h>
+#include <pthread.h>
 #include <sched.h>
 #include <signal.h>
 #include <stdatomic.h>
@@ -126,6 +128,9 @@ struct worker_arg {
 static int worker_body(void *p)
 {
 	struct worker_arg *wa = p;
+
+	/* Raw clone() children must drop the inherited attachment */
+	rfm_thread_reset_after_fork();
 	return worker(wa->a, wa->idx, wa->hold_every, wa->alloc);
 }
 
@@ -392,10 +397,327 @@ static int test_alloc_reuse(enum rfm_alloc alloc)
 	return failed;
 }
 
+/*
+ * Concurrent first attachment: the vDSO symbol resolution and TSD setup
+ * must be thread safe. Must run before anything else attaches in this
+ * process so the threads really race the one-time initialization.
+ */
+#define RACE_THREADS 8
+
+struct race_arg {
+	rfm_region_t		*r;
+	pthread_barrier_t	*barrier;
+	rfmutex_t		*mtx;
+};
+
+static void *race_attach_fn(void *p)
+{
+	struct race_arg *ra = p;
+	int ret;
+
+	pthread_barrier_wait(ra->barrier);
+	ret = rfm_thread_attach(ra->r, RFM_ALLOC_NONE);
+	if (ret)
+		return (void *)(long)ret;
+	/* The counter path uses the second vDSO entry point */
+	ret = rfm_mutex_lock(ra->mtx);
+	if (ret)
+		return (void *)(long)ret;
+	return (void *)(long)rfm_mutex_unlock(ra->mtx);
+}
+
+static int test_attach_race(void)
+{
+	rfm_region_t *r;
+	struct testarea *a = setup(&r, RFM_TYPE_COUNTER);
+	pthread_barrier_t barrier;
+	pthread_t th[RACE_THREADS];
+	struct race_arg ra;
+	int failed = 0;
+
+	if (!a)
+		return 1;
+	pthread_barrier_init(&barrier, NULL, RACE_THREADS);
+	ra = (struct race_arg){ .r = r, .barrier = &barrier, .mtx = &a->mtx };
+
+	for (int i = 0; i < RACE_THREADS; i++)
+		pthread_create(&th[i], NULL, race_attach_fn, &ra);
+	for (int i = 0; i < RACE_THREADS; i++) {
+		void *ret;
+
+		pthread_join(th[i], &ret);
+		failed |= (ret != NULL);
+	}
+	pthread_barrier_destroy(&barrier);
+	printf("%s concurrent first attach (%d threads)\n",
+	       failed ? "FAIL" : "OK", RACE_THREADS);
+	rfm_region_detach(r);
+	return failed;
+}
+
+/*
+ * A thread which does not own the mutex must not be able to unlock it,
+ * and the failed attempt must not damage the owner's robust list.
+ */
+struct nonowner_arg {
+	rfm_region_t	*r;
+	rfmutex_t	*mtx;
+	enum rfm_alloc	alloc;
+};
+
+static void *nonowner_fn(void *p)
+{
+	struct nonowner_arg *na = p;
+
+	if (rfm_thread_attach(na->r, na->alloc))
+		return (void *)1L;
+	/* Not the owner: both unlock attempts must be rejected */
+	if (rfm_mutex_unlock(na->mtx) != -EPERM)
+		return (void *)2L;
+	if (rfm_mutex_trylock(na->mtx) != EBUSY)
+		return (void *)3L;
+	if (rfm_mutex_unlock(na->mtx) != -EPERM)
+		return (void *)4L;
+	rfm_thread_detach(na->r);
+	return NULL;
+}
+
+static int test_nonowner_unlock(enum rfm_type type, enum rfm_alloc alloc)
+{
+	rfm_region_t *r;
+	struct testarea *a = setup(&r, type);
+	struct nonowner_arg na;
+	pthread_t th;
+	void *tret;
+	int failed = 0;
+
+	if (!a)
+		return 1;
+	if (rfm_thread_attach(r, alloc)) {
+		printf("FAIL %s nonowner unlock: attach\n", type_name(type));
+		rfm_region_detach(r);
+		return 1;
+	}
+	failed |= rfm_mutex_lock(&a->mtx) != 0;
+
+	na = (struct nonowner_arg){ .r = r, .mtx = &a->mtx, .alloc = alloc };
+	pthread_create(&th, NULL, nonowner_fn, &na);
+	pthread_join(th, &tret);
+	failed |= (tret != NULL);
+
+	/* The owner's list must be intact: unlock and relock still work */
+	failed |= rfm_mutex_unlock(&a->mtx) != 0;
+	failed |= rfm_mutex_lock(&a->mtx) != 0;
+	failed |= rfm_mutex_unlock(&a->mtx) != 0;
+
+	printf("%s %s nonowner unlock rejected (thread ret %ld)\n",
+	       failed ? "FAIL" : "OK", type_name(type), (long)tret);
+	rfm_thread_detach(r);
+	rfm_region_detach(r);
+	return failed;
+}
+
+/*
+ * fork(): the child's inherited attachment must be reset (robust list
+ * and rseq are not inherited by the kernel), a fresh attach must get a
+ * new cookie, and robustness must work in the re-attached child.
+ */
+static int test_fork_reset(void)
+{
+	rfm_region_t *r;
+	struct testarea *a = setup(&r, RFM_TYPE_EXPLICIT);
+	rfmutex_t *m2;
+	int failed = 0, wstatus;
+	pid_t pid;
+
+	if (!a)
+		return 1;
+	m2 = (rfmutex_t *)(a + 1);
+	rfm_mutex_init(m2, RFM_TYPE_EXPLICIT);
+
+	if (rfm_thread_attach(r, RFM_ALLOC_REGISTRY) ||
+	    rfm_thread_cookie() != 1 || rfm_mutex_lock(&a->mtx)) {
+		printf("FAIL fork reset: parent setup\n");
+		rfm_region_detach(r);
+		return 1;
+	}
+
+	pid = fork();
+	if (!pid) {
+		/* pthread_atfork must have dropped the attachment */
+		if (rfm_thread_cookie() != 0)
+			_exit(1);
+		/* Unattached use fails cleanly */
+		if (rfm_mutex_lock(m2) != -EINVAL)
+			_exit(2);
+		if (rfm_thread_attach(r, RFM_ALLOC_REGISTRY))
+			_exit(3);
+		/* The parent is alive and keeps its slot */
+		if (rfm_thread_cookie() == 1)
+			_exit(4);
+		/* The parent's lock is not ours */
+		if (rfm_mutex_unlock(&a->mtx) != -EPERM)
+			_exit(5);
+		/* Die holding m2: robustness after fork + re-attach */
+		if (rfm_mutex_lock(m2))
+			_exit(6);
+		kill(getpid(), SIGKILL);
+		_exit(7);
+	}
+	waitpid(pid, &wstatus, 0);
+	failed |= !(WIFSIGNALED(wstatus) && WTERMSIG(wstatus) == SIGKILL);
+
+	/* Parent state is untouched */
+	failed |= rfm_mutex_unlock(&a->mtx) != 0;
+	/* The dead child's lock is recoverable */
+	failed |= rfm_mutex_lock(m2) != EOWNERDEAD;
+	failed |= rfm_mutex_consistent(m2) != 0;
+	failed |= rfm_mutex_unlock(m2) != 0;
+
+	printf("%s fork reset + child robustness (status %x)\n",
+	       failed ? "FAIL" : "OK", wstatus);
+	rfm_thread_detach(r);
+	rfm_region_detach(r);
+	return failed;
+}
+
+/*
+ * OFD cookies must coordinate on the inode of the mapped region, not on
+ * a pathname: after a rename plus a decoy file at the old path, a second
+ * allocation must still conflict with the first one.
+ */
+static void *ofd_attach_fn(void *p)
+{
+	rfm_region_t *r = p;
+
+	if (rfm_thread_attach(r, RFM_ALLOC_OFD))
+		return (void *)-1L;
+	return (void *)(long)rfm_thread_cookie();
+}
+
+static int test_ofd_identity(void)
+{
+	rfm_region_t *r;
+	struct testarea *a = setup(&r, RFM_TYPE_EXPLICIT);
+	pthread_t th;
+	void *tcookie;
+	int failed = 0, fd;
+
+	if (!a)
+		return 1;
+	if (rfm_thread_attach(r, RFM_ALLOC_OFD) || rfm_thread_cookie() != 1) {
+		printf("FAIL ofd identity: first attach\n");
+		rfm_region_detach(r);
+		return 1;
+	}
+
+	/* Rename the region file and plant a decoy at the old path */
+	failed |= rename(REGION_PATH, REGION_PATH ".moved") != 0;
+	fd = open(REGION_PATH, O_RDWR | O_CREAT, 0666);
+	failed |= fd < 0;
+	if (fd >= 0)
+		close(fd);
+
+	/* Second allocation: same inode, so it must not get cookie 1 */
+	pthread_create(&th, NULL, ofd_attach_fn, r);
+	pthread_join(th, &tcookie);
+	failed |= (long)tcookie != 2;
+
+	printf("%s ofd inode identity after rename (second cookie %ld)\n",
+	       failed ? "FAIL" : "OK", (long)tcookie);
+	unlink(REGION_PATH);
+	unlink(REGION_PATH ".moved");
+	rfm_thread_detach(r);
+	rfm_region_detach(r);
+	return failed;
+}
+
+/*
+ * Threads exiting without rfm_thread_detach() must release their cookie
+ * lease via the TSD destructor - otherwise the fixed pool is exhausted
+ * after RFM_REGISTRY_SLOTS thread lifetimes.
+ */
+static void *churn_attach_fn(void *p)
+{
+	struct nonowner_arg *na = p;
+
+	if (rfm_thread_attach(na->r, na->alloc) || !rfm_thread_cookie())
+		return (void *)1L;
+	return NULL;	/* no detach: the TSD destructor must release */
+}
+
+static int test_thread_churn(enum rfm_alloc alloc)
+{
+	rfm_region_t *r;
+	struct testarea *a = setup(&r, RFM_TYPE_EXPLICIT);
+	struct nonowner_arg na;
+	int failed = 0;
+
+	if (!a)
+		return 1;
+	na = (struct nonowner_arg){ .r = r, .alloc = alloc };
+
+	for (int i = 0; i < RFM_REGISTRY_SLOTS + 40 && !failed; i++) {
+		pthread_t th;
+		void *tret;
+
+		pthread_create(&th, NULL, churn_attach_fn, &na);
+		pthread_join(th, &tret);
+		failed |= (tret != NULL);
+	}
+
+	printf("%s %s lease released on thread exit (%d thread lifetimes)\n",
+	       failed ? "FAIL" : "OK", alloc_name(alloc),
+	       RFM_REGISTRY_SLOTS + 40);
+	rfm_region_detach(r);
+	return failed;
+}
+
+/*
+ * File descriptor 0 is a valid descriptor: the OFD lease must work with
+ * it and must be closed by detach (a leaked description would keep the
+ * byte lock and the second attach would get a different cookie).
+ */
+static int test_ofd_fd0(void)
+{
+	rfm_region_t *r;
+	struct testarea *a = setup(&r, RFM_TYPE_EXPLICIT);
+	int failed = 0, wstatus;
+	pid_t pid;
+
+	if (!a)
+		return 1;
+	pid = fork();
+	if (!pid) {
+		close(0);
+		if (rfm_thread_attach(r, RFM_ALLOC_OFD))
+			_exit(1);
+		if (rfm_thread_cookie() != 1)
+			_exit(2);
+		rfm_thread_detach(r);
+		/* Cookie 1 free again iff the fd 0 lease was closed */
+		if (rfm_thread_attach(r, RFM_ALLOC_OFD))
+			_exit(3);
+		if (rfm_thread_cookie() != 1)
+			_exit(4);
+		_exit(0);
+	}
+	waitpid(pid, &wstatus, 0);
+	failed |= WEXITSTATUS(wstatus) != 0;
+
+	printf("%s ofd lease on fd 0 (child status %d)\n",
+	       failed ? "FAIL" : "OK", WEXITSTATUS(wstatus));
+	rfm_region_detach(r);
+	return failed;
+}
+
 int main(int argc, char **argv)
 {
 	int failed = 0;
 	int dur = argc > 1 ? atoi(argv[1]) : 400;
+
+	/* Must be first: races the process wide one-time initialization */
+	failed |= test_attach_race();
 
 	failed |= test_alloc_reuse(RFM_ALLOC_REGISTRY);
 	failed |= test_alloc_reuse(RFM_ALLOC_OFD);
@@ -413,6 +735,14 @@ int main(int argc, char **argv)
 	failed |= test_kill_stress(RFM_TYPE_COUNTER, true, 4, 20, 4 * dur);
 
 	failed |= test_counter_generations(4, 2 * dur);
+
+	failed |= test_nonowner_unlock(RFM_TYPE_EXPLICIT, RFM_ALLOC_REGISTRY);
+	failed |= test_nonowner_unlock(RFM_TYPE_COUNTER, RFM_ALLOC_NONE);
+	failed |= test_fork_reset();
+	failed |= test_ofd_identity();
+	failed |= test_thread_churn(RFM_ALLOC_REGISTRY);
+	failed |= test_thread_churn(RFM_ALLOC_OFD);
+	failed |= test_ofd_fd0();
 
 	printf("%s\n", failed ? "TEST SUITE FAILED" : "ALL TESTS PASSED");
 	return failed;

@@ -198,10 +198,18 @@ struct warg {
 static int contended_loop(void *p)
 {
 	struct warg *wa = p;
-	rfm_region_t *r = rfm_region_attach(REGION_PATH);
+	rfm_region_t *r;
 	struct bencharea *a;
 	uint64_t local = 0;
 
+	/*
+	 * Raw clone() child: pthread_atfork handlers did not run, drop
+	 * the inherited attachment before re-attaching, otherwise this
+	 * process would run without a registered robust list.
+	 */
+	rfm_thread_reset_after_fork();
+
+	r = rfm_region_attach(REGION_PATH);
 	if (!r)
 		return 1;
 	a = rfm_region_base(r);
@@ -257,8 +265,14 @@ static void bench_contended(struct bencharea *a, enum impl im, int nworkers,
 	atomic_store(&a->stop, 1);
 	t1 = now_ns();
 
-	for (int i = 0; i < nworkers; i++)
+	for (int i = 0; i < nworkers; i++) {
 		waitpid(pids[i], &wstatus, 0);
+		if (!WIFEXITED(wstatus) || WEXITSTATUS(wstatus)) {
+			printf("%-28s: worker %d failed (status %d)\n",
+			       impl_names[im], i, wstatus);
+			return;
+		}
+	}
 
 	printf("%-28s: %8.0f kops/s (%d workers contended)\n",
 	       im == IMPL_PTHREAD ? "pthread (pshared)" : impl_names[im],

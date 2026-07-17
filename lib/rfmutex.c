@@ -7,6 +7,7 @@
 #include <fcntl.h>
 #include <linux/futex.h>
 #include <linux/membarrier.h>
+#include <pthread.h>
 #include <sched.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -41,6 +42,10 @@ struct robust_list_head2 {
 #endif
 
 #define RSEQ_SIG	0x53053053
+
+#ifndef RSEQ_FLAG_UNREGISTER
+#define RSEQ_FLAG_UNREGISTER	(1 << 0)
+#endif
 
 struct rseq_area {
 	uint32_t cpu_id_start;
@@ -101,8 +106,19 @@ typedef uint32_t (*vdso_cmpxchg_rseq_t)(struct robust_list **pending_ptr, uint64
 					_Atomic(uint32_t) *lock, uint32_t expect,
 					uint32_t set, volatile struct rseq_area *rseq);
 
-static vdso_try_unlock_t vdso_try_unlock;
-static vdso_cmpxchg_rseq_t vdso_cmpxchg_rseq;
+/*
+ * The vDSO entry points are resolved exactly once, under pthread_once():
+ * concurrent first attachments must either observe the complete set of
+ * pointers or block until resolution finished, and a partial resolution
+ * (e.g. a kernel with the try_unlock helper but without the cmpxchg
+ * helper) is a cached hard failure instead of a poisoned half state.
+ */
+static struct {
+	vdso_try_unlock_t	try_unlock;
+	vdso_cmpxchg_rseq_t	cmpxchg_rseq;
+	int			rc;
+} vdso;
+static pthread_once_t vdso_once = PTHREAD_ONCE_INIT;
 
 static void *vdso_sym(const char *name)
 {
@@ -117,6 +133,20 @@ static void *vdso_sym(const char *name)
 	return NULL;
 }
 
+static void vdso_resolve(void)
+{
+	vdso_try_unlock_t tu = vdso_sym("__vdso_futex_robust_list64_try_unlock");
+	vdso_cmpxchg_rseq_t cx = vdso_sym("__vdso_futex_robust_list64_cmpxchg_rseq");
+
+	if (!tu || !cx) {
+		vdso.rc = -ENOSYS;
+		return;
+	}
+	vdso.try_unlock = tu;
+	vdso.cmpxchg_rseq = cx;
+	vdso.rc = 0;
+}
+
 /* ---------------------------------------------------------------------
  * Per thread state
  */
@@ -125,12 +155,73 @@ struct rfm_tls {
 	volatile struct rseq_area *rseq;
 	struct rseq_area own_rseq;
 	uint32_t cookie;	/* explicit mode thread cookie, 0 if none */
-	int ofd_fd;
+	int ofd_fd;		/* -1 if none: 0 is a valid descriptor */
 	rfmutex_t *slot;	/* registry slot held, if any */
 	int attached;
 };
 
-static __thread struct rfm_tls rfm_tls;
+static __thread struct rfm_tls rfm_tls = { .ofd_fd = -1 };
+
+static void rfm_thread_release_cookie(struct rfm_tls *t);
+static bool rfm_holds_locks(struct rfm_tls *t);
+
+/*
+ * Thread exit releases the thread's cookie lease automatically: an OFD
+ * lock lives on the open file description, which is process wide and
+ * thus not released by a thread silently exiting, and a leaked registry
+ * slot would only be reclaimed when the whole process dies.
+ */
+static pthread_key_t rfm_tsd_key;
+static pthread_once_t rfm_tsd_once = PTHREAD_ONCE_INIT;
+
+static void rfm_tsd_dtor(void *p)
+{
+	rfm_thread_release_cookie(p);
+}
+
+static void rfm_tsd_init(void)
+{
+	if (pthread_key_create(&rfm_tsd_key, rfm_tsd_dtor))
+		abort();
+}
+
+/*
+ * fork() and clone(..., SIGCHLD, ...) reset the kernel side per task
+ * state (robust list and rseq registrations do not survive into the
+ * child), but the copied TLS still claims to be attached, and the
+ * copied cookie lease (registry slot / OFD lock) is owned by the
+ * parent. Reset everything; the child must call rfm_thread_attach()
+ * again before using any rfmutex. Installed via pthread_atfork() below;
+ * children created with a raw clone() must call it themselves.
+ */
+void rfm_thread_reset_after_fork(void)
+{
+	struct rfm_tls *t = &rfm_tls;
+
+	/*
+	 * The open file description behind an inherited OFD fd is shared
+	 * with the parent which owns the lock: closing the child's
+	 * descriptor only drops a reference and never releases it.
+	 */
+	if (t->ofd_fd >= 0)
+		close(t->ofd_fd);
+	/*
+	 * The child inherits the parent's rseq registration. If it
+	 * points into this TLS block, drop it so that the re-attach can
+	 * register it freshly (a glibc owned registration stays).
+	 */
+	if (t->rseq == &t->own_rseq)
+		sys_rseq(&t->own_rseq, sizeof(t->own_rseq),
+			 RSEQ_FLAG_UNREGISTER, RSEQ_SIG);
+	memset(t, 0, sizeof(*t));
+	t->ofd_fd = -1;
+}
+
+__attribute__((constructor))
+static void rfm_atfork_init(void)
+{
+	pthread_atfork(NULL, NULL, rfm_thread_reset_after_fork);
+}
 
 #define RFM_TID_MASK	0x3fffffffU
 #define RFM_WAITERS	0x80000000U
@@ -154,12 +245,17 @@ static int rfm_thread_init_common(void)
 	if (t->attached)
 		return 0;
 
-	if (!vdso_try_unlock) {
-		vdso_try_unlock = vdso_sym("__vdso_futex_robust_list64_try_unlock");
-		vdso_cmpxchg_rseq = vdso_sym("__vdso_futex_robust_list64_cmpxchg_rseq");
-		if (!vdso_try_unlock || !vdso_cmpxchg_rseq)
-			return -ENOSYS;
-	}
+	pthread_once(&vdso_once, vdso_resolve);
+	if (vdso.rc)
+		return vdso.rc;
+
+	/*
+	 * Register the TSD destructor which releases the cookie lease
+	 * when the thread exits without rfm_thread_detach().
+	 */
+	pthread_once(&rfm_tsd_once, rfm_tsd_init);
+	if (pthread_setspecific(rfm_tsd_key, t))
+		return -ENOMEM;
 
 	/* rseq registration (needed for RFM_TYPE_COUNTER) */
 	if (!sys_rseq(&t->own_rseq, sizeof(t->own_rseq), 0, RSEQ_SIG)) {
@@ -414,7 +510,7 @@ static int rfm_lock_counter(rfmutex_t *m, bool try_only)
 		t->h.list_op_pending_cookie = c;
 		atomic_signal_fence(memory_order_seq_cst);
 
-		if (vdso_cmpxchg_rseq(&t->h.head.list_op_pending,
+		if (vdso.cmpxchg_rseq(&t->h.head.list_op_pending,
 				      (uint64_t)(uintptr_t)rfm_entry(m),
 				      &m->word, w, set, t->rseq)) {
 			atomic_store_explicit(&t->rseq->rseq_cs, 0,
@@ -450,7 +546,7 @@ static int rfm_unlock_common(rfmutex_t *m, uint32_t c)
 	 * Fast path: uncontended, consistent lock word. The vDSO helper
 	 * clears the pending op atomically with a successful cmpxchg.
 	 */
-	if (vdso_try_unlock(&m->word, c, &t->h.head.list_op_pending) != c) {
+	if (vdso.try_unlock(&m->word, c, &t->h.head.list_op_pending) != c) {
 		/* Contended or OWNER_DIED set: kernel unlock + wake */
 		rfm_wake_all_robust(t, m);
 	}
@@ -483,14 +579,44 @@ int rfm_mutex_trylock(rfmutex_t *m)
 	return rfm_lock_explicit(m, true);
 }
 
+/*
+ * The calling thread owns @m iff the entry sits on its robust list.
+ * The list is thread private, so the walk is safe, and its length is
+ * the number of locks the thread currently holds.
+ */
+static bool rfm_owns(struct rfm_tls *t, rfmutex_t *m)
+{
+	uintptr_t head = (uintptr_t)&t->h.head.list;
+	uintptr_t e = (uintptr_t)t->h.head.list.next;
+
+	if (!t->attached)
+		return false;
+	for (; e && e != head; e = atomic_load_explicit(&rfm_from_entry(e)->next,
+							memory_order_relaxed)) {
+		if (e == (uintptr_t)rfm_entry(m))
+			return true;
+	}
+	return false;
+}
+
 int rfm_mutex_unlock(rfmutex_t *m)
 {
+	struct rfm_tls *t = &rfm_tls;
 	uint32_t c;
 
-	if (m->type == RFM_TYPE_COUNTER)
+	if (m->type == RFM_TYPE_COUNTER) {
+		/*
+		 * The current cookie in m->cookie is shared state which
+		 * any thread could read, so it cannot authenticate the
+		 * caller. Ownership is established by the entry being
+		 * on the calling thread's (private) robust list.
+		 */
+		if (!rfm_owns(t, m))
+			return -EPERM;
 		c = atomic_load_explicit(&m->cookie, memory_order_relaxed);
-	else
-		c = rfm_tls.cookie;
+	} else {
+		c = t->cookie;
+	}
 
 	if (!c || (atomic_load_explicit(&m->word, memory_order_relaxed) &
 		   RFM_TID_MASK) != c)
@@ -527,7 +653,16 @@ struct rfm_region_hdr {
 struct rfm_region {
 	struct rfm_region_hdr *hdr;
 	size_t size;
-	char path[256];
+	/*
+	 * The backing file, kept open for the lifetime of the region.
+	 * OFD cookie allocation takes its byte range locks on fresh open
+	 * file descriptions of *this* fd (via /proc/self/fd), never on a
+	 * pathname: after a rename or unlink/recreate a pathname can
+	 * name a different inode than the mapped region, and byte locks
+	 * on two different files would hand out duplicate live cookies.
+	 * O_CLOEXEC: an exec'd image knows nothing about the lease.
+	 */
+	int fd;
 };
 
 rfm_region_t *rfm_region_create(const char *path, size_t size)
@@ -536,7 +671,7 @@ rfm_region_t *rfm_region_create(const char *path, size_t size)
 	int fd;
 
 	size += sizeof(struct rfm_region_hdr);
-	fd = open(path, O_RDWR | O_CREAT, 0666);
+	fd = open(path, O_RDWR | O_CREAT | O_CLOEXEC, 0666);
 	if (fd < 0)
 		return NULL;
 	if (ftruncate(fd, size)) {
@@ -546,10 +681,10 @@ rfm_region_t *rfm_region_create(const char *path, size_t size)
 
 	r = calloc(1, sizeof(*r));
 	r->size = size;
-	snprintf(r->path, sizeof(r->path), "%s", path);
+	r->fd = fd;
 	r->hdr = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-	close(fd);
 	if (r->hdr == MAP_FAILED) {
+		close(fd);
 		free(r);
 		return NULL;
 	}
@@ -569,7 +704,7 @@ rfm_region_t *rfm_region_attach(const char *path)
 	struct stat st;
 	int fd;
 
-	fd = open(path, O_RDWR);
+	fd = open(path, O_RDWR | O_CLOEXEC, 0);
 	if (fd < 0)
 		return NULL;
 	if (fstat(fd, &st)) {
@@ -579,10 +714,10 @@ rfm_region_t *rfm_region_attach(const char *path)
 
 	r = calloc(1, sizeof(*r));
 	r->size = st.st_size;
-	snprintf(r->path, sizeof(r->path), "%s", path);
+	r->fd = fd;
 	r->hdr = mmap(NULL, r->size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-	close(fd);
 	if (r->hdr == MAP_FAILED || r->hdr->magic != RFM_MAGIC) {
+		close(fd);
 		free(r);
 		return NULL;
 	}
@@ -602,6 +737,7 @@ size_t rfm_region_size(rfm_region_t *r)
 void rfm_region_detach(rfm_region_t *r)
 {
 	munmap(r->hdr, r->size);
+	close(r->fd);
 	free(r);
 }
 
@@ -610,10 +746,26 @@ void rfm_region_detach(rfm_region_t *r)
  * held with cookie k+1 for the lifetime of the thread and sits on the
  * thread's robust list, so the kernel marks it OWNER_DIED when the
  * thread dies without detaching.
+ *
+ * The slot entry is the *lease* which keeps the cookie allocated. It is
+ * enqueued at attach time, before any mutex can be locked, and entries
+ * are enqueued LIFO, so the exit walk reaches it after every held lock.
+ * The kernel additionally guarantees for ROBUST_LIST_COOKIE lists that
+ * the pending op is handled before any queued entry: a cookie observed
+ * as released (slot OWNER_DIED) can therefore be reused immediately
+ * without racing against the dead thread's leftover cleanup.
  */
 static int rfm_alloc_registry(rfm_region_t *r)
 {
 	struct rfm_tls *t = &rfm_tls;
+
+	/*
+	 * The slot entry must end up last in the walk order (see
+	 * rfm_thread_release_cookie()), so it may only be enqueued
+	 * while the list holds no lock entries.
+	 */
+	if (rfm_holds_locks(t))
+		return -EBUSY;
 
 	for (uint32_t k = 0; k < r->hdr->nslots; k++) {
 		rfmutex_t *s = &r->hdr->slots[k];
@@ -656,8 +808,16 @@ static int rfm_alloc_registry(rfm_region_t *r)
 static int rfm_alloc_ofd(rfm_region_t *r)
 {
 	struct rfm_tls *t = &rfm_tls;
-	int fd = open(r->path, O_RDWR);
+	char fdpath[64];
+	int fd;
 
+	/*
+	 * A fresh open file description of the region's own fd: same
+	 * inode as the mapping by construction (see struct rfm_region),
+	 * unlike a reopened pathname.
+	 */
+	snprintf(fdpath, sizeof(fdpath), "/proc/self/fd/%d", r->fd);
+	fd = open(fdpath, O_RDWR | O_CLOEXEC, 0);
 	if (fd < 0)
 		return -errno;
 
@@ -702,20 +862,52 @@ int rfm_thread_attach(rfm_region_t *r, enum rfm_alloc alloc)
 	return -EINVAL;
 }
 
-void rfm_thread_detach(rfm_region_t *r)
+/* Any entry on the thread's robust list other than its registry slot */
+static bool rfm_holds_locks(struct rfm_tls *t)
 {
-	struct rfm_tls *t = &rfm_tls;
+	uintptr_t head = (uintptr_t)&t->h.head.list;
+	uintptr_t e = (uintptr_t)t->h.head.list.next;
 
-	(void)r;
+	for (; e && e != head;
+	     e = atomic_load_explicit(&rfm_from_entry(e)->next,
+				      memory_order_relaxed)) {
+		if (!t->slot || e != (uintptr_t)rfm_entry(t->slot))
+			return true;
+	}
+	return false;
+}
+
+static void rfm_thread_release_cookie(struct rfm_tls *t)
+{
+	/*
+	 * The cookie lease must outlive every lock the thread still
+	 * holds: the kernel exit cleanup only handles those after the
+	 * thread died, and a cookie released before that walk finishes
+	 * could be reused while the walk still has unprocessed entries
+	 * carrying it. A thread exiting while holding locks therefore
+	 * leaks its lease deliberately: the registry slot stays locked
+	 * and is reclaimed by the kernel walk (which reaches it last,
+	 * because it was enqueued first), and an OFD description is
+	 * released at process exit, after all futex exit cleanup.
+	 */
+	if (rfm_holds_locks(t))
+		return;
+
 	if (t->slot) {
 		rfm_unlock_common(t->slot, t->cookie);
 		t->slot = NULL;
 	}
-	if (t->ofd_fd > 0) {
+	if (t->ofd_fd >= 0) {
 		close(t->ofd_fd);
-		t->ofd_fd = 0;
+		t->ofd_fd = -1;
 	}
 	t->cookie = 0;
+}
+
+void rfm_thread_detach(rfm_region_t *r)
+{
+	(void)r;
+	rfm_thread_release_cookie(&rfm_tls);
 }
 
 uint32_t rfm_thread_cookie(void)
@@ -761,6 +953,7 @@ static int rfm_bare_entry(void *p)
 int rfm_run_libcless(int (*fn)(void *), void *arg)
 {
 	struct rfm_bare b = { .fn = fn, .arg = arg, .ret = 0 };
+	struct rfm_tls saved = rfm_tls;
 	volatile pid_t ctid = 1;
 	char *stack;
 	long tid;
@@ -770,6 +963,20 @@ int rfm_run_libcless(int (*fn)(void *), void *arg)
 	if (stack == MAP_FAILED)
 		return -errno;
 
+	/*
+	 * The bare thread runs without CLONE_SETTLS and therefore
+	 * *borrows this thread's TLS block* (the spawner is parked in
+	 * the join loop below for the whole run, so there is no
+	 * concurrent use). Its task starts with no rseq and no robust
+	 * list regardless of what this thread registered, so hand it a
+	 * clean rfm_tls and restore the spawner's state afterwards -
+	 * otherwise a previous attachment (of either thread) would make
+	 * rfm_thread_init_common() skip the kernel registrations for
+	 * the new tid.
+	 */
+	memset(&rfm_tls, 0, sizeof(rfm_tls));
+	rfm_tls.ofd_fd = -1;
+
 	tid = clone(rfm_bare_entry, stack + RFM_BARE_STACK,
 		    CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND |
 		    CLONE_THREAD | CLONE_CHILD_CLEARTID,
@@ -777,6 +984,7 @@ int rfm_run_libcless(int (*fn)(void *), void *arg)
 	if (tid < 0) {
 		int e = errno;
 
+		rfm_tls = saved;
 		munmap(stack, RFM_BARE_STACK);
 		return -e;
 	}
@@ -792,6 +1000,16 @@ int rfm_run_libcless(int (*fn)(void *), void *arg)
 			break;
 		syscall(SYS_futex, &ctid, FUTEX_WAIT, v, NULL, NULL, 0);
 	}
+
+	/*
+	 * The bare thread is dead and its robust list walk has run. If
+	 * it left an OFD lease open (exit without detach; the file
+	 * table is shared), release it now.
+	 */
+	if (rfm_tls.ofd_fd >= 0)
+		close(rfm_tls.ofd_fd);
+	rfm_tls = saved;
+
 	munmap(stack, RFM_BARE_STACK);
 	return b.ret;
 }
