@@ -1,3 +1,4 @@
+\* SPDX-License-Identifier: MIT
 #!/bin/bash
 # SPDX-License-Identifier: MIT
 #
@@ -95,36 +96,46 @@ step "QEMU guest tests" "$HERE/harness/runqemu.sh" -c "$(nproc)" -t 900
 step "benchmark smoke" "$HERE/lib/bench_rfmutex" 20000 200 4
 
 # --- 5. TLA+ model matrix ------------------------------------------------
-# name:expected outcome. "pass" = no error found; "violation" = TLC must
-# report an invariant or temporal property violation (a spec which
-# cannot fail proves nothing).
+# name:expected:deadlockflag. "pass" = no error found; "violation" = TLC
+# must report an invariant or temporal property violation (a spec which
+# cannot fail proves nothing). "nodl" runs with deadlock checking
+# enabled (the waiter-model configs have no intentional terminal
+# states); "dl" passes -deadlock (the counter model's bounded counter
+# makes exhausted-counter states terminal by design, and the
+# violation-expected configs stop at their counterexample anyway).
 MODELS_QUICK="
-MCExplicitOK:pass
-MCExplicitLeaseABA:violation
-MCExplicitLeaseOrder:violation
-MCExplicitOldABI:violation
-MCExplicitTid:violation
-MCCounterOKLive:pass
-MCCounterNoFence:pass
-MCCounterNoGate:pass
-MCCounterBit1:pass
-MCCounterNoExitFixup:violation
-MCCounterOrigDesign:violation
-MCCounterOldABI:violation
+MCExplicitOK:pass:nodl
+MCExplicitNoWake:violation:nodl
+MCExplicitLostWaiter:violation:nodl
+MCExplicitLeaseABA:violation:dl
+MCExplicitLeaseOrder:violation:dl
+MCExplicitOldABI:violation:dl
+MCExplicitTid:violation:dl
+MCCounterOKLive:pass:dl
+MCCounterNoFence:pass:dl
+MCCounterNoGate:pass:dl
+MCCounterBit1:pass:dl
+MCCounterNoExitFixup:violation:dl
+MCCounterOrigDesign:violation:dl
+MCCounterOldABI:violation:dl
 "
-MODELS_EXHAUSTIVE="MCCounterOK10:pass"
+MODELS_EXHAUSTIVE="MCCounterOK10:pass:dl"
 
 run_model() {
-    local name="$1" expect="$2"
+    local name="$1" expect="$2" dl="$3"
     local log="$HERE/tla/runs/$name.log"
+    local dlflag=""
+    [ "$dl" = dl ] && dlflag="-deadlock"
     mkdir -p "$HERE/tla/runs"
     (cd "$HERE/tla" && $JAVA -XX:+UseParallelGC -cp tla2tools.jar tlc2.TLC \
-        -workers "$(nproc)" -deadlock "$name") > "$log" 2>&1
+        -workers "$(nproc)" $dlflag "$name") > "$log" 2>&1
     local outcome=fail
     if grep -q "Model checking completed. No error has been found" "$log"; then
         outcome=pass
     elif grep -qE "^Error: (Invariant|Temporal property).*violated" "$log"; then
         outcome=violation
+    elif grep -q "Deadlock reached" "$log"; then
+        outcome=deadlock
     fi
     note "model $name: $outcome (expected $expect; $(grep -oE '[0-9,]+ states generated' "$log" | tail -1))"
     [ "$outcome" = "$expect" ]
@@ -133,7 +144,8 @@ run_model() {
 MODELS="$MODELS_QUICK"
 [ "$PROFILE" = exhaustive ] && MODELS="$MODELS_QUICK $MODELS_EXHAUSTIVE"
 for m in $MODELS; do
-    step "model ${m%%:*}" run_model "${m%%:*}" "${m##*:}"
+    IFS=: read -r mname mexpect mdl <<< "$m"
+    step "model $mname" run_model "$mname" "$mexpect" "$mdl"
 done
 
 # --- summary -------------------------------------------------------------

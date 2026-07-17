@@ -1,4 +1,4 @@
-From 15a08f392f3de8c35a23f10f20d8f782cb869e51 Mon Sep 17 00:00:00 2001
+From 3e393700fa94ceb01c3db089f60826cf8733c904 Mon Sep 17 00:00:00 2001
 From: Keno Fischer <keno@juliahub.com>
 Date: Thu, 16 Jul 2026 08:22:52 +0000
 Subject: [PATCH 5/6] sched/membarrier: Add
@@ -57,8 +57,11 @@ walk, so unlike the other registrations no runqueue state
 synchronization is required; registration is a simple atomic_or plus the
 barrier which orders it against subsequent memory accesses.
 
+This series was developed with the assistance of Claude (an AI
+assistant by Anthropic); the author reviewed, validated and takes
+responsibility for the changes.
+
 Signed-off-by: Keno Fischer <keno@juliahub.com>
-Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
 
 squash! sched/membarrier: Add MEMBARRIER_CMD_SHARED_EXPEDITED_RSEQ
 
@@ -79,14 +82,34 @@ leading smp_mb(): the fence may skip a task only if that task's
 subsequent RSEQ sequence observes everything the fence caller wrote
 before fencing. Without the smp_mb__after_atomic() the store-buffering
 outcome is observable (Sometimes).
+
+squash! sched/membarrier: Add MEMBARRIER_CMD_SHARED_EXPEDITED_RSEQ
+
+Restrict the fence to the addressed base page (issue #24): the rmap
+walk visits every VMA mapping any page of the folio, so on a multi page
+folio a process mapping only other pages would have been targeted.
+Filter the VMAs against the pinned page's object offset.
+
+Bound the work under the global membarrier serialization (issue #25):
+the VMA count is user space controlled, so the per-VMA linear scan of
+all online CPUs allowed unprivileged callers to inflate the critical
+section to O(VMAs x CPUs). Snapshot (mm, cpu) pairs once, sort by mm
+and binary search per VMA: O((VMAs + CPUs) log CPUs).
+
+squash! sched/membarrier: Add MEMBARRIER_CMD_SHARED_EXPEDITED_RSEQ
+
+Complete the rmap walk rework (issues 24/25): the previous squash was
+generated from a partially applied edit and kept the old per-VMA
+all-CPU scan and full-folio targeting in the walk callback while
+already snapshotting sorted (mm, cpu) pairs in the caller.
 ---
  Documentation/litmus-tests/README             |  11 +
  .../membarrier-shared-rseq-ready.litmus       |  49 ++++
  include/linux/sched/mm.h                      |   2 +
  include/linux/syscalls.h                      |   3 +-
  include/uapi/linux/membarrier.h               |  34 +++
- kernel/sched/membarrier.c                     | 215 +++++++++++++++++-
- 6 files changed, 310 insertions(+), 4 deletions(-)
+ kernel/sched/membarrier.c                     | 269 +++++++++++++++++-
+ 6 files changed, 364 insertions(+), 4 deletions(-)
  create mode 100644 Documentation/litmus-tests/membarrier/membarrier-shared-rseq-ready.litmus
 
 diff --git a/Documentation/litmus-tests/README b/Documentation/litmus-tests/README
@@ -246,19 +269,20 @@ index 5f3ad6d5be6f..e23b65bedd8b 100644
  	/* Alias for header backward compatibility. */
  	MEMBARRIER_CMD_SHARED			= MEMBARRIER_CMD_GLOBAL,
 diff --git a/kernel/sched/membarrier.c b/kernel/sched/membarrier.c
-index cb957b8f1946..1b6d66596b27 100644
+index cb957b8f1946..7973fdd3f373 100644
 --- a/kernel/sched/membarrier.c
 +++ b/kernel/sched/membarrier.c
-@@ -5,6 +5,8 @@
+@@ -5,6 +5,9 @@
   * membarrier system call
   */
  #include <uapi/linux/membarrier.h>
 +#include <linux/pagemap.h>
 +#include <linux/rmap.h>
++#include <linux/sort.h>
  #include "sched.h"
  
  /*
-@@ -155,6 +157,14 @@
+@@ -155,6 +158,14 @@
  #define MEMBARRIER_PRIVATE_EXPEDITED_RSEQ_BITMASK	0
  #endif
  
@@ -273,7 +297,7 @@ index cb957b8f1946..1b6d66596b27 100644
  #define MEMBARRIER_CMD_BITMASK						\
  	(MEMBARRIER_CMD_GLOBAL | MEMBARRIER_CMD_GLOBAL_EXPEDITED	\
  	| MEMBARRIER_CMD_REGISTER_GLOBAL_EXPEDITED			\
-@@ -162,6 +172,7 @@
+@@ -162,6 +173,7 @@
  	| MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED			\
  	| MEMBARRIER_PRIVATE_EXPEDITED_SYNC_CORE_BITMASK		\
  	| MEMBARRIER_PRIVATE_EXPEDITED_RSEQ_BITMASK			\
@@ -281,20 +305,42 @@ index cb957b8f1946..1b6d66596b27 100644
  	| MEMBARRIER_CMD_GET_REGISTRATIONS)
  
  /*
-@@ -442,6 +453,190 @@ static int membarrier_private_expedited(int flags, int cpu_id)
+@@ -442,6 +454,243 @@ static int membarrier_private_expedited(int flags, int cpu_id)
  	return 0;
  }
  
 +#if defined(CONFIG_RSEQ) && defined(CONFIG_MMU)
 +/**
 + * struct membarrier_shared_rseq_walk - rmap walk state for the shared RSEQ fence
-+ * @mms:	Snapshot of each online CPU's current task's mm
++ * @mcs:	Snapshot of each online CPU's current task's mm, sorted by
++ *		mm pointer for binary search
++ * @nr_mcs:	Number of valid entries in @mcs
++ * @pgoff:	Page offset (in the mapped object) of the base page
++ *		containing the syscall's address argument
 + * @cpumask:	Result mask of CPUs which need an RSEQ IPI
 + */
++struct membarrier_mm_cpu {
++	struct mm_struct	*mm;
++	unsigned int		cpu;
++};
++
 +struct membarrier_shared_rseq_walk {
-+	struct mm_struct	**mms;
++	struct membarrier_mm_cpu *mcs;
++	unsigned int		nr_mcs;
++	pgoff_t			pgoff;
 +	struct cpumask		*cpumask;
 +};
++
++static int membarrier_mm_cpu_cmp(const void *a, const void *b)
++{
++	const struct membarrier_mm_cpu *x = a, *y = b;
++
++	if (x->mm < y->mm)
++		return -1;
++	if (x->mm > y->mm)
++		return 1;
++	return 0;
++}
 +
 +static bool membarrier_shared_rseq_rmap_one(struct folio *folio,
 +					    struct vm_area_struct *vma,
@@ -302,7 +348,18 @@ index cb957b8f1946..1b6d66596b27 100644
 +{
 +	struct membarrier_shared_rseq_walk *walk = priv;
 +	struct mm_struct *mm = vma->vm_mm;
-+	int cpu;
++	unsigned int lo = 0, hi = walk->nr_mcs, i;
++
++	/*
++	 * The rmap walk visits every VMA mapping any page of the folio.
++	 * The fence targets exactly the base page containing the
++	 * caller's address: a process mapping only *other* pages of a
++	 * large folio does not share the fenced page and must not be
++	 * disturbed.
++	 */
++	if (walk->pgoff < vma->vm_pgoff ||
++	    walk->pgoff - vma->vm_pgoff >= vma_pages(vma))
++		return true;
 +
 +	/* Only shared and actually write mapped VMAs are eligible */
 +	if ((vma->vm_flags & (VM_SHARED | VM_WRITE)) != (VM_SHARED | VM_WRITE))
@@ -313,10 +370,22 @@ index cb957b8f1946..1b6d66596b27 100644
 +	      MEMBARRIER_STATE_SHARED_EXPEDITED_RSEQ_READY))
 +		return true;
 +
-+	for_each_online_cpu(cpu) {
-+		if (walk->mms[cpu] == mm)
-+			__cpumask_set_cpu(cpu, walk->cpumask);
++	/*
++	 * Binary search the CPU snapshot (sorted by mm): the VMA count
++	 * is user space controlled, so a linear scan of all CPUs per
++	 * VMA would allow unprivileged callers to inflate the time
++	 * spent under the global membarrier serialization.
++	 */
++	while (lo < hi) {
++		unsigned int mid = lo + (hi - lo) / 2;
++
++		if (walk->mcs[mid].mm < mm)
++			lo = mid + 1;
++		else
++			hi = mid;
 +	}
++	for (i = lo; i < walk->nr_mcs && walk->mcs[i].mm == mm; i++)
++		__cpumask_set_cpu(walk->mcs[i].cpu, walk->cpumask);
 +
 +	return true;
 +}
@@ -339,7 +408,7 @@ index cb957b8f1946..1b6d66596b27 100644
 +		.rmap_one	= membarrier_shared_rseq_rmap_one,
 +		.arg		= &walk,
 +	};
-+	struct mm_struct **mms __free(kfree) = NULL;
++	struct membarrier_mm_cpu *mcs __free(kfree) = NULL;
 +	cpumask_var_t __free(free_cpumask_var) tmpmask = CPUMASK_VAR_NULL;
 +	struct folio *folio;
 +	struct page *page;
@@ -368,13 +437,16 @@ index cb957b8f1946..1b6d66596b27 100644
 +	}
 +	folio = page_folio(page);
 +
-+	mms = kcalloc(nr_cpu_ids, sizeof(*mms), GFP_KERNEL);
-+	if (!mms || !zalloc_cpumask_var(&tmpmask, GFP_KERNEL)) {
++	mcs = kcalloc(num_possible_cpus(), sizeof(*mcs), GFP_KERNEL);
++	if (!mcs || !zalloc_cpumask_var(&tmpmask, GFP_KERNEL)) {
 +		put_page(page);
 +		return -ENOMEM;
 +	}
 +
-+	walk.mms = mms;
++	walk.mcs = mcs;
++	walk.nr_mcs = 0;
++	/* The object page offset of the pinned base page, see rmap_one() */
++	walk.pgoff = folio->index + folio_page_idx(folio, page);
 +	walk.cpumask = tmpmask;
 +
 +	scoped_guard(mb) {
@@ -403,10 +475,15 @@ index cb957b8f1946..1b6d66596b27 100644
 +				struct task_struct *p;
 +
 +				p = rcu_dereference(cpu_rq(cpu)->curr);
-+				if (p && p->mm)
-+					walk.mms[cpu] = p->mm;
++				if (p && p->mm) {
++					walk.mcs[walk.nr_mcs].mm = p->mm;
++					walk.mcs[walk.nr_mcs].cpu = cpu;
++					walk.nr_mcs++;
++				}
 +			}
 +		}
++		sort(walk.mcs, walk.nr_mcs, sizeof(*walk.mcs),
++		     membarrier_mm_cpu_cmp, NULL);
 +
 +		/*
 +		 * Walk all mappings of the pinned folio and collect the
@@ -472,7 +549,7 @@ index cb957b8f1946..1b6d66596b27 100644
  static int sync_runqueues_membarrier_state(struct mm_struct *mm)
  {
  	int membarrier_state = atomic_read(&mm->membarrier_state);
-@@ -574,13 +769,16 @@ static int membarrier_get_registrations(void)
+@@ -574,13 +823,16 @@ static int membarrier_get_registrations(void)
  		MEMBARRIER_STATE_PRIVATE_EXPEDITED_SYNC_CORE |
  			MEMBARRIER_STATE_PRIVATE_EXPEDITED_SYNC_CORE_READY,
  		MEMBARRIER_STATE_PRIVATE_EXPEDITED_RSEQ |
@@ -491,7 +568,7 @@ index cb957b8f1946..1b6d66596b27 100644
  	};
  	BUILD_BUG_ON(ARRAY_SIZE(states) != ARRAY_SIZE(registration_cmds));
  
-@@ -606,6 +804,12 @@ static int membarrier_get_registrations(void)
+@@ -606,6 +858,12 @@ static int membarrier_get_registrations(void)
   * @cpu_id: if @flags == MEMBARRIER_CMD_FLAG_CPU, indicates the cpu on which
   *          RSEQ CS should be interrupted (@cmd must be
   *          MEMBARRIER_CMD_PRIVATE_EXPEDITED_RSEQ).
@@ -504,7 +581,7 @@ index cb957b8f1946..1b6d66596b27 100644
   *
   * If this system call is not implemented, -ENOSYS is returned. If the
   * command specified does not exist, not available on the running
-@@ -631,7 +835,8 @@ static int membarrier_get_registrations(void)
+@@ -631,7 +889,8 @@ static int membarrier_get_registrations(void)
   *        smp_mb()           X           O            O
   *        sys_membarrier()   O           O            O
   */
@@ -514,7 +591,7 @@ index cb957b8f1946..1b6d66596b27 100644
  {
  	switch (cmd) {
  	case MEMBARRIER_CMD_PRIVATE_EXPEDITED_RSEQ:
-@@ -680,6 +885,10 @@ SYSCALL_DEFINE3(membarrier, int, cmd, unsigned int, flags, int, cpu_id)
+@@ -680,6 +939,10 @@ SYSCALL_DEFINE3(membarrier, int, cmd, unsigned int, flags, int, cpu_id)
  		return membarrier_register_private_expedited(MEMBARRIER_FLAG_RSEQ);
  	case MEMBARRIER_CMD_GET_REGISTRATIONS:
  		return membarrier_get_registrations();

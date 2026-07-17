@@ -1,3 +1,4 @@
+\* SPDX-License-Identifier: MIT
 #!/bin/sh
 # SPDX-License-Identifier: MIT
 # The checked-in guest runner for the full validation: kernel futex and

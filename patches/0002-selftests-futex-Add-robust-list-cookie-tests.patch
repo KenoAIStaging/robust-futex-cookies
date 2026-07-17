@@ -1,4 +1,4 @@
-From 2e440e700a63bab4c0b5b28eeac5d13b0a819bbc Mon Sep 17 00:00:00 2001
+From bbad295ad7b14219cb5eba06a178cf3f4582cf8d Mon Sep 17 00:00:00 2001
 From: Keno Fischer <keno@juliahub.com>
 Date: Thu, 16 Jul 2026 08:20:22 +0000
 Subject: [PATCH 2/6] selftests/futex: Add robust list cookie tests
@@ -26,8 +26,11 @@ Also widen the grace periods of the documented wait vs. exit races so
 the tests are reliable in slow emulated environments, and raise the
 futex_wait() timeout accordingly.
 
+This series was developed with the assistance of Claude (an AI
+assistant by Anthropic); the author reviewed, validated and takes
+responsibility for the changes.
+
 Signed-off-by: Keno Fischer <keno@juliahub.com>
-Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
 
 squash! selftests/futex: Add robust list cookie tests
 
@@ -37,12 +40,20 @@ reuses the cookie on the pending op's lock), a linked pending op whose
 ->next is overwritten by a new owner mid-walk, a pending op linked at
 every list position and an unreadable pending op which must not
 suppress the cleanup of valid entries.
+
+squash! selftests/futex: Add robust list cookie tests
+
+The pending op mismatch case now expects the deterministic wake up
+which the kernel issues when discarding a dying task's pending op for
+a foreign owned lock (the consumed-wakeup replay), while still
+requiring the futex value to be untouched; the queued entry mismatch
+case still expects a timeout.
 ---
- .../selftests/futex/functional/robust_list.c  | 810 +++++++++++++++++-
- 1 file changed, 807 insertions(+), 3 deletions(-)
+ .../selftests/futex/functional/robust_list.c  | 823 +++++++++++++++++-
+ 1 file changed, 820 insertions(+), 3 deletions(-)
 
 diff --git a/tools/testing/selftests/futex/functional/robust_list.c b/tools/testing/selftests/futex/functional/robust_list.c
-index b3fab60181d5..120968f140b1 100644
+index b3fab60181d5..190fbc74923b 100644
 --- a/tools/testing/selftests/futex/functional/robust_list.c
 +++ b/tools/testing/selftests/futex/functional/robust_list.c
 @@ -41,9 +41,13 @@
@@ -75,7 +86,7 @@ index b3fab60181d5..120968f140b1 100644
  	ASSERT_EQ(ret, -1);
  	ASSERT_EQ(errno, EINVAL);
  
-@@ -788,4 +797,799 @@ TEST_F(futex_op, test_futex_robust_unlock)
+@@ -788,4 +797,812 @@ TEST_F(futex_op, test_futex_robust_unlock)
  	ASSERT_EQ((uintptr_t)(unsigned long)head.list_op_pending, exp);
  }
  
@@ -311,10 +322,23 @@ index b3fab60181d5..120968f140b1 100644
 +		 */
 +		ASSERT_EQ(ret, 0);
 +		ASSERT_TRUE(atomic_load(futex) & FUTEX_OWNER_DIED);
++	} else if (error_inject) {
++		/*
++		 * A foreign owned lock with the dying child's pending op
++		 * on it: the kernel must not touch the futex value, but
++		 * it wakes one potential waiter when discarding the
++		 * pending op - the dying task may have consumed a wakeup
++		 * it could no longer act on. This waiter is woken and
++		 * observes the unchanged word (a real lock loop would
++		 * re-arm FUTEX_WAITERS and wait again).
++		 */
++		ASSERT_EQ(ret, 0);
++		ASSERT_FALSE(atomic_load(futex) & FUTEX_OWNER_DIED);
++		ASSERT_EQ(atomic_load(futex) & FUTEX_TID_MASK, lock_cookie);
 +	} else {
 +		/*
-+		 * The lock looks foreign owned: the kernel must not touch
-+		 * it, so the wait times out.
++		 * A foreign owned queued entry: the kernel must neither
++		 * touch it nor wake anybody, so the wait times out.
 +		 */
 +		ASSERT_EQ(ret, -1);
 +		ASSERT_EQ(errno, ETIMEDOUT);

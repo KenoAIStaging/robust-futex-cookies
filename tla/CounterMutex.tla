@@ -1,3 +1,4 @@
+\* SPDX-License-Identifier: MIT
 ---------------------------- MODULE CounterMutex ----------------------------
 (***************************************************************************)
 (* The counter based robust futex protocol: every lock operation reserves *)

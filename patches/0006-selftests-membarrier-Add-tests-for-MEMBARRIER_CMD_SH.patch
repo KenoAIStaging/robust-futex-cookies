@@ -1,4 +1,4 @@
-From 2962828916b516f2caa8e2019e8452c831a1c74c Mon Sep 17 00:00:00 2001
+From 1210f230aa7506e1583ca888361c1f8dd666ea60 Mon Sep 17 00:00:00 2001
 From: Keno Fischer <keno@juliahub.com>
 Date: Thu, 16 Jul 2026 08:23:02 +0000
 Subject: [PATCH 6/6] selftests/membarrier: Add tests for
@@ -22,13 +22,27 @@ Exercise the shared RSEQ fence:
   - A registered process which does not map the fenced page is not
     disturbed.
 
+This series was developed with the assistance of Claude (an AI
+assistant by Anthropic); the author reviewed, validated and takes
+responsibility for the changes.
+
 Signed-off-by: Keno Fischer <keno@juliahub.com>
-Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+
+squash! selftests/membarrier: Add tests for MEMBARRIER_CMD_SHARED_EXPEDITED_RSEQ
+
+Gate the build on x86-64 (issue #29): the RSEQ spin loop is x86-64
+assembly, and the generic membarrier Makefile is built on every
+architecture.
+
+Make the positive fence test unable to pass without fencing (issue
+30): aborts observed before the first fence (startup preemptions or
+migrations) are discarded, at least one fence is always issued, and
+only an abort observed after a fence satisfies the test.
 ---
  tools/testing/selftests/membarrier/.gitignore |   1 +
- tools/testing/selftests/membarrier/Makefile   |   3 +-
- .../membarrier/membarrier_shared_rseq_test.c  | 416 ++++++++++++++++++
- 3 files changed, 419 insertions(+), 1 deletion(-)
+ tools/testing/selftests/membarrier/Makefile   |   6 +
+ .../membarrier/membarrier_shared_rseq_test.c  | 432 ++++++++++++++++++
+ 3 files changed, 439 insertions(+)
  create mode 100644 tools/testing/selftests/membarrier/membarrier_shared_rseq_test.c
 
 diff --git a/tools/testing/selftests/membarrier/.gitignore b/tools/testing/selftests/membarrier/.gitignore
@@ -41,24 +55,26 @@ index f2fbba178601..e3df8c5e0488 100644
  membarrier_test_single_thread
 +membarrier_shared_rseq_test
 diff --git a/tools/testing/selftests/membarrier/Makefile b/tools/testing/selftests/membarrier/Makefile
-index 829f95c83515..b1df937623dd 100644
+index 829f95c83515..24b5f9e754d8 100644
 --- a/tools/testing/selftests/membarrier/Makefile
 +++ b/tools/testing/selftests/membarrier/Makefile
-@@ -4,6 +4,7 @@ LDLIBS += -lpthread
- 
- TEST_GEN_PROGS := membarrier_test_single_thread \
+@@ -6,4 +6,10 @@ TEST_GEN_PROGS := membarrier_test_single_thread \
  		membarrier_test_multi_thread \
--		membarrier_rseq_stress
-+		membarrier_rseq_stress \
-+		membarrier_shared_rseq_test
+ 		membarrier_rseq_stress
  
++# Contains x86-64 specific RSEQ assembly
++ARCH ?= $(shell uname -m 2>/dev/null || echo not)
++ifneq (,$(filter x86_64,$(ARCH)))
++TEST_GEN_PROGS += membarrier_shared_rseq_test
++endif
++
  include ../lib.mk
 diff --git a/tools/testing/selftests/membarrier/membarrier_shared_rseq_test.c b/tools/testing/selftests/membarrier/membarrier_shared_rseq_test.c
 new file mode 100644
-index 000000000000..0f7b67e4c410
+index 000000000000..e12b22edc1b7
 --- /dev/null
 +++ b/tools/testing/selftests/membarrier/membarrier_shared_rseq_test.c
-@@ -0,0 +1,416 @@
+@@ -0,0 +1,432 @@
 +// SPDX-License-Identifier: GPL-2.0-or-later
 +/*
 + * Tests for MEMBARRIER_CMD_SHARED_EXPEDITED_RSEQ: an RSEQ fence targeting
@@ -66,6 +82,10 @@ index 000000000000..0f7b67e4c410
 + * have registered with MEMBARRIER_CMD_REGISTER_SHARED_EXPEDITED_RSEQ.
 + */
 +#define _GNU_SOURCE
++#ifndef __x86_64__
++#error "This test contains x86-64 specific RSEQ assembly (see the Makefile gate)"
++#endif
++
 +#include <errno.h>
 +#include <linux/futex.h>
 +#include <linux/membarrier.h>
@@ -347,7 +367,7 @@ index 000000000000..0f7b67e4c410
 +TEST_F(shared_rseq, fence_aborts_target)
 +{
 +	struct shared_state *sh = self->sh;
-+	int wstatus, tries;
++	int wstatus, tries, fences;
 +	pid_t pid;
 +
 +	ASSERT_EQ(sys_membarrier(MEMBARRIER_CMD_REGISTER_SHARED_EXPEDITED_RSEQ,
@@ -362,17 +382,29 @@ index 000000000000..0f7b67e4c410
 +	ASSERT_TRUE(atomic_load(&sh->in_cs));
 +
 +	/*
++	 * Discard aborts which happened before the first fence (startup
++	 * preemptions/migrations also abort the critical section): the
++	 * test must never pass without issuing at least one fence, and
++	 * only aborts observed after a fence count.
++	 */
++	atomic_store(&sh->aborts, 0);
++
++	/*
 +	 * The child spends a few instructions per abort outside of the
 +	 * critical section, so a fence can miss. Retry a couple of times.
 +	 */
-+	for (tries = 0; !atomic_load(&sh->aborts) && tries < 100; tries++) {
++	for (tries = 0, fences = 0; tries < 100; tries++) {
 +		ASSERT_EQ(sys_membarrier(MEMBARRIER_CMD_SHARED_EXPEDITED_RSEQ,
 +					 0, 0, (unsigned long)sh), 0);
++		fences++;
 +		usleep(10000);
++		if (atomic_load(&sh->aborts))
++			break;
 +	}
 +
 +	stop_spinner(sh, pid, &wstatus);
 +	ASSERT_EQ(WEXITSTATUS(wstatus), 0);
++	ASSERT_GT(fences, 0);
 +	ASSERT_GT(atomic_load(&sh->aborts), 0);
 +}
 +

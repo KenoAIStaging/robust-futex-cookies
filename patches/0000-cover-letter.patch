@@ -1,6 +1,6 @@
-From 2962828916b516f2caa8e2019e8452c831a1c74c Mon Sep 17 00:00:00 2001
+From 1210f230aa7506e1583ca888361c1f8dd666ea60 Mon Sep 17 00:00:00 2001
 From: Keno Fischer <Keno@users.noreply.github.com>
-Date: Fri, 17 Jul 2026 04:57:37 +0000
+Date: Fri, 17 Jul 2026 08:55:52 +0000
 Subject: [PATCH 0/6] futex: PID namespace agnostic robust futexes via owner cookies
 
 Robust futexes identify the lock owner by storing the owner's TID in the
@@ -105,7 +105,7 @@ Keno Fischer (6):
 
  Documentation/litmus-tests/README             |   11 +
  .../membarrier-shared-rseq-ready.litmus       |   49 +
- Documentation/locking/robust-futex-ABI.rst    |   85 ++
+ Documentation/locking/robust-futex-ABI.rst    |   89 ++
  arch/x86/entry/vdso/common/vfutex.c           |  126 ++
  arch/x86/entry/vdso/vdso32/vdso32.lds.S       |    1 +
  arch/x86/entry/vdso/vdso64/vdso64.lds.S       |    2 +
@@ -120,18 +120,18 @@ Keno Fischer (6):
  include/linux/rseq_entry.h                    |   32 +-
  include/linux/sched/mm.h                      |    2 +
  include/linux/syscalls.h                      |    3 +-
- include/uapi/linux/futex.h                    |   58 +
+ include/uapi/linux/futex.h                    |   69 +
  include/uapi/linux/membarrier.h               |   34 +
- include/vdso/futex.h                          |   83 ++
- kernel/futex/core.c                           |  290 +++-
+ include/vdso/futex.h                          |   91 ++
+ kernel/futex/core.c                           |  341 ++++-
  kernel/futex/futex.h                          |    9 +
- kernel/futex/syscalls.c                       |   66 +-
- kernel/sched/membarrier.c                     |  215 ++-
- .../selftests/futex/functional/robust_list.c  | 1220 ++++++++++++++++-
+ kernel/futex/syscalls.c                       |  127 +-
+ kernel/sched/membarrier.c                     |  269 +++-
+ .../selftests/futex/functional/robust_list.c  | 1344 ++++++++++++++++-
  tools/testing/selftests/membarrier/.gitignore |    1 +
- tools/testing/selftests/membarrier/Makefile   |    3 +-
- .../membarrier/membarrier_shared_rseq_test.c  |  416 ++++++
- 28 files changed, 2747 insertions(+), 43 deletions(-)
+ tools/testing/selftests/membarrier/Makefile   |    6 +
+ .../membarrier/membarrier_shared_rseq_test.c  |  432 ++++++
+ 28 files changed, 3072 insertions(+), 50 deletions(-)
  create mode 100644 Documentation/litmus-tests/membarrier/membarrier-shared-rseq-ready.litmus
  create mode 100644 tools/testing/selftests/membarrier/membarrier_shared_rseq_test.c
 

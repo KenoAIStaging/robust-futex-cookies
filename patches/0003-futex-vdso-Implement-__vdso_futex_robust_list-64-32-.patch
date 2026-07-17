@@ -1,4 +1,4 @@
-From 1b97be253231dbf366f573ad603e66e239a2da1c Mon Sep 17 00:00:00 2001
+From 12e89d7d9aab5ba1cce41680e9cbff8cf03501a9 Mon Sep 17 00:00:00 2001
 From: Keno Fischer <keno@juliahub.com>
 Date: Thu, 16 Jul 2026 08:22:29 +0000
 Subject: [PATCH 3/6] futex/vdso: Implement
@@ -112,8 +112,27 @@ emulators:
 
 The 32-bit VDSO provides only the list32 variant.
 
+This series was developed with the assistance of Claude (an AI
+assistant by Anthropic); the author reviewed, validated and takes
+responsibility for the changes.
+
 Signed-off-by: Keno Fischer <keno@juliahub.com>
-Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+
+squash! futex/vdso: Implement __vdso_futex_robust_list{64,32}_cmpxchg_rseq()
+
+Fail closed when the signal time fixup cannot disarm the pending op
+(issue #23): a signal handler which never returns through the abort
+landing pad (siglongjmp, thread exit) would leave the stale pending op
+armed, and the pending slot can be in a different page than the signal
+frame, so a failing disarm does not imply that the frame setup fails as
+well. Use futex_robust_list_clear_pending(), which drops the robust
+list registration when the slot cannot be cleared.
+
+Correct the caller contract documentation (issue #32): the reserved
+identifier goes into the task private list_op_pending_cookie before the
+call, and into the shared entry cookie only after success - a contender
+must never overwrite a live owner's entry cookie. Also fix the missing
+brace in the pseudo code.
 ---
  Documentation/locking/robust-futex-ABI.rst |   5 +-
  arch/x86/entry/vdso/common/vfutex.c        | 126 +++++++++++++++++++++
@@ -127,16 +146,16 @@ Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
  include/linux/futex.h                      |  11 ++
  include/linux/futex_types.h                |  18 ++-
  include/linux/rseq_entry.h                 |  32 +++++-
- include/vdso/futex.h                       |  83 ++++++++++++++
- kernel/futex/core.c                        | 119 ++++++++++++++++++-
- 14 files changed, 431 insertions(+), 7 deletions(-)
+ include/vdso/futex.h                       |  91 +++++++++++++++
+ kernel/futex/core.c                        | 114 ++++++++++++++++++-
+ 14 files changed, 434 insertions(+), 7 deletions(-)
 
 diff --git a/Documentation/locking/robust-futex-ABI.rst b/Documentation/locking/robust-futex-ABI.rst
-index 5265fdabcd04..208bc025b205 100644
+index 36a564c87a4b..d044dcd3aec7 100644
 --- a/Documentation/locking/robust-futex-ABI.rst
 +++ b/Documentation/locking/robust-futex-ABI.rst
-@@ -302,7 +302,10 @@ all tasks which can hold the lock, the same way TIDs are unique among
- all tasks within one PID namespace. Uniqueness can be organized, for
+@@ -306,7 +306,10 @@ skipped, as are entries carrying the PI modifier bit. The 'flags' and
+ '__reserved' fields are validated at registration time. Uniqueness can be organized, for
  instance, with allocation tables in the shared memory itself (with the
  allocations guarded by robust futexes on the table slots), with OFD
 -file locks on a shared file, or with per lock reservation counters.
@@ -554,10 +573,10 @@ index ed9da6e41a2a..27483c0c2e43 100644
  die:
  	t->rseq.event.fatal = true;
 diff --git a/include/vdso/futex.h b/include/vdso/futex.h
-index 3cd175eefe64..2796bcf42a27 100644
+index 3cd175eefe64..249393857134 100644
 --- a/include/vdso/futex.h
 +++ b/include/vdso/futex.h
-@@ -49,4 +49,87 @@ __u32 __vdso_futex_robust_list64_try_unlock(__u32 *lock, __u32 tid, __u64 *pop);
+@@ -49,4 +49,95 @@ __u32 __vdso_futex_robust_list64_try_unlock(__u32 *lock, __u32 tid, __u64 *pop);
   */
  __u32 __vdso_futex_robust_list32_try_unlock(__u32 *lock, __u32 tid, __u32 *pop);
  
@@ -584,7 +603,7 @@ index 3cd175eefe64..2796bcf42a27 100644
 + *	if (!rseq->rseq_cs)
 + *		return 0;
 + *	*pending_ptr = pending;
-+ *	if (!atomic_try_cmpxchg(lock, &expect, set))
++ *	if (!atomic_try_cmpxchg(lock, &expect, set)) {
 + *		*pending_ptr = NULL;
 + *		return 0;
 + *	}
@@ -613,19 +632,27 @@ index 3cd175eefe64..2796bcf42a27 100644
 + *     reservation invalidation detector across such a call.
 + *
 + *  2) Reserve an owner identifier for the lock word (e.g. via an atomic
-+ *     counter increment) and store it in the cookie field of the robust
-+ *     list entry.
++ *     counter increment) and store it in the *task private*
++ *     robust_list_head2::list_op_pending_cookie field. It must NOT be
++ *     stored in the entry cookie yet: the entry is embedded in the
++ *     shared lock and may still belong to a live owner - a contender
++ *     overwriting that owner's entry cookie before its own cmpxchg
++ *     succeeded would make the owner's death unrecoverable. The exit
++ *     cleanup attributes the pending op exclusively through the task
++ *     private field.
 + *
 + *  3) Invoke this function.
 + *
-+ *  4) Clear rseq->rseq_cs. On success, queue the entry in the robust
-+ *     list and disarm the pending op. On failure, handle contention and
-+ *     retry with a fresh reservation.
++ *  4) Clear rseq->rseq_cs. On success - and only then - store the
++ *     identifier in the entry cookie (the caller now owns the entry
++ *     exclusively), queue the entry in the robust list and disarm the
++ *     pending op. On failure, do not touch the entry cookie; handle
++ *     contention and retry with a fresh reservation.
 + *
-+ * On success the pending op stays armed, with the lock word holding the
-+ * cookie which is also reachable for the kernel through the pending
-+ * entry, until the caller disarms it in step 4, mirroring the
-+ * list_op_pending protocol of the original robust list.
++ * On success the pending op stays armed - attributed via
++ * robust_list_head2::list_op_pending_cookie - with the lock word holding
++ * the same identifier, until the caller disarms it in step 4, mirroring
++ * the list_op_pending protocol of the original robust list.
 + */
 +__u32 __vdso_futex_robust_list64_cmpxchg_rseq(__u64 *pending_ptr, __u64 pending,
 +					      __u32 *lock, __u32 expect, __u32 set,
@@ -646,10 +673,10 @@ index 3cd175eefe64..2796bcf42a27 100644
 +
  #endif
 diff --git a/kernel/futex/core.c b/kernel/futex/core.c
-index 510a1619b627..6c029fe3d2fd 100644
+index 96638872ebae..d9c64032e57d 100644
 --- a/kernel/futex/core.c
 +++ b/kernel/futex/core.c
-@@ -1556,11 +1556,121 @@ void __futex_fixup_robust_unlock(struct pt_regs *regs, struct futex_unlock_cs_ra
+@@ -1604,11 +1604,116 @@ void __futex_fixup_robust_unlock(struct pt_regs *regs, struct futex_unlock_cs_ra
  	futex_robust_list_clear_pending(pop, csr->pop_size32 ? FLAGS_ROBUST_LIST32 : 0);
  }
  
@@ -670,26 +697,21 @@ index 510a1619b627..6c029fe3d2fd 100644
 +
 +	/*
 +	 * Disarm the pending op and move the task to the abort IP, which
-+	 * makes the VDSO function return failure. The abort code disarms
-+	 * the pending op again, which makes this safe against an
-+	 * unresolvable fault of the user access here:
++	 * makes the VDSO function return failure.
 +	 *
-+	 *  - If this is a fixup for an interrupt induced RSEQ event, the
-+	 *    task resumes at the abort IP and the store either succeeds or
-+	 *    the task gets a signal delivered.
-+	 *
-+	 *  - If this is a fixup prior to signal delivery, the write to the
-+	 *    user address is only required to protect against a signal
-+	 *    handler which does not return to the interrupted context. In
-+	 *    that case the handler stack frame setup will fail for the
-+	 *    same reason and the task is terminated by SIGSEGV, which
-+	 *    makes the robust exit cleanup process the still armed pending
-+	 *    op correctly.
++	 * The disarm must not fail open: if this is a fixup prior to
++	 * signal delivery and the handler never returns through the
++	 * abort landing pad (siglongjmp(), thread exit, ...), nothing
++	 * disarms the pending op later, and the exit walk would process
++	 * a stale, never validated pending cookie - which can match a
++	 * reused (wrapped) identifier. The pending slot can be in a
++	 * different page than the signal frame, so a failing disarm here
++	 * does not imply that the frame setup fails as well. Therefore
++	 * use the fail closed helper, which drops the task's robust list
++	 * registration when the slot cannot be cleared: better a few
++	 * stale futexes than a misattributed live one.
 +	 */
-+	if (csr->pop_size32)
-+		put_user(0U, (u32 __user *)pop);
-+	else
-+		put_user(0UL, (unsigned long __user *)pop);
++	futex_robust_list_clear_pending(pop, csr->pop_size32 ? FLAGS_ROBUST_LIST32 : 0);
 +
 +	instruction_pointer_set(regs, csr->abort_ip);
 +}
@@ -772,7 +794,7 @@ index 510a1619b627..6c029fe3d2fd 100644
  		exit_robust_list(tsk);
  		tsk->futex.robust_list = NULL;
  		tsk->futex.robust_list_flags = 0;
-@@ -1568,6 +1678,7 @@ static void futex_cleanup(struct task_struct *tsk)
+@@ -1616,6 +1721,7 @@ static void futex_cleanup(struct task_struct *tsk)
  
  #ifdef CONFIG_COMPAT
  	if (unlikely(tsk->futex.compat_robust_list)) {
@@ -780,7 +802,7 @@ index 510a1619b627..6c029fe3d2fd 100644
  		compat_exit_robust_list(tsk);
  		tsk->futex.compat_robust_list = NULL;
  		tsk->futex.compat_robust_list_flags = 0;
-@@ -2094,13 +2205,15 @@ static void futex_invalidate_cs_ranges(struct futex_mm_data *fd)
+@@ -2142,13 +2248,15 @@ static void futex_invalidate_cs_ranges(struct futex_mm_data *fd)
  	 * tasks as they use VDSO32 which does not provide the 64-bit pointer
  	 * variant.
  	 */

@@ -1,0 +1,47 @@
+Licensing map for this repository
+=================================
+
+- lib/, bench/, harness/, initramfs/, validate.sh, tla/*.tla, tla/MC*:
+  MIT License (per-file SPDX-License-Identifier: MIT headers; full text
+  below).
+
+- patches/: Linux kernel patches. Each patch carries the upstream
+  kernel licensing of the files it modifies (predominantly
+  GPL-2.0-only / GPL-2.0-or-later, see the SPDX identifiers inside the
+  patches). They are intended for submission to and merging into the
+  Linux kernel and are licensed accordingly.
+
+- README.md, tla/README.md, litmus/, bench/RESULTS.md and other
+  original documentation and data: MIT License.
+
+- tla/tla2tools.jar: bundled build of the TLA+ tools (TLC), an upstream
+  project of the TLA+ Foundation, licensed under the MIT License:
+  https://github.com/tlaplus/tlaplus
+  Bundled build: master revision 227f61b983d0203a06db8184da45aed421e8f1b8,
+  built 2026-07-15 (see the jar's META-INF/MANIFEST.MF; the jar embeds
+  its upstream LICENSE). sha256:
+  58d44845a37a8d776deaf8cf3a623213b59d311bc0ec287bcdfbe148dd11bb3d
+
+MIT License
+-----------
+
+Copyright (c) 2026 the repository contributors
+
+Permission is hereby granted, free of charge, to any person obtaining a
+copy of this software and associated documentation files (the
+"Software"), to deal in the Software without restriction, including
+without limitation the rights to use, copy, modify, merge, publish,
+distribute, sublicense, and/or sell copies of the Software, and to
+permit persons to whom the Software is furnished to do so, subject to
+the following conditions:
+
+The above copyright notice and this permission notice shall be included
+in all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
+TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.

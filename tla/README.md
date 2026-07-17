@@ -15,9 +15,15 @@ analogue of the 30-bit space with the generation in bit 29).
   steps* (pending op, slot entry, mutex entry) so that the walk order
   is part of the modeled protocol — a cookie becomes reusable as soon
   as the slot entry was processed, not when the whole walk finished.
-  Switches select the kernel walk order (`PendingFirst`), the lease
-  position in the list (`LeaseLast`), the pending attribution ABI
-  (`PendingViaHead`) and fixed TID-style identifiers (`UseAllocator`).
+  The model includes futex waiters: the WAITERS bit, sleeping threads,
+  FUTEX_WAKE(1) with an *adversarial* choice of the woken waiter, the
+  kernel wakes in the exit cleanup (including handle_futex_death()'s
+  unconditional wake for a pending op whose word is already released),
+  and the woken acquirer's WAITERS re-assertion. Switches select the
+  kernel walk order (`PendingFirst`), the lease position in the list
+  (`LeaseLast`), the pending attribution ABI (`PendingViaHead`), fixed
+  TID-style identifiers (`UseAllocator`), the cleanup wake
+  (`WakeOnCleanup`) and the WAITERS re-assertion (`WaitedBit`).
 
 - `CounterMutex.tla` — the per mutex reservation counter protocol: RSEQ
   guard ("no event since armed" detector), the vDSO cmpxchg helper with
@@ -34,10 +40,24 @@ safety properties are directly checkable:
   unique ghost owner and the lock word carries its identifier.
 - `Recovery` (liveness) — a lock whose owner died is eventually
   recovered (requires weak fairness on the kernel cleanup).
+- `NoLostWakeup` (liveness, explicit model) — wake events keep
+  occurring while a live waiter sleeps persistently. Deliberately NOT
+  per-waiter starvation freedom: futex wakes carry no fairness promise
+  and TLC readily produces the starvation lasso (a rival waiter
+  re-consuming every wake) if per-waiter progress is asserted — that is
+  inherent to futex based locks, pthread mutexes included.
 
 ## Results matrix
 
-Run: `java -cp tla2tools.jar tlc2.TLC -workers N -deadlock MC<name>`.
+Run: `java -cp tla2tools.jar tlc2.TLC -workers N [-deadlock] MC<name>`,
+or all of them with expected outcomes via `../validate.sh`. The waiter
+configurations (`MCExplicitOK/NoWake/LostWaiter`) run **with deadlock
+checking enabled** (they have no intentional terminal states); the
+counter model keeps `-deadlock` (its bounded miniature counter makes
+exhausted-counter states terminal by design), as do the
+violation-expected configurations (they stop at their counterexample).
+Per-run logs land in `runs/` (see `validate.sh`'s manifest for tool and
+artifact provenance).
 
 | Config                | Models                                            | Result |
 |-----------------------|---------------------------------------------------|--------|
@@ -47,9 +67,9 @@ Run: `java -cp tla2tools.jar tlc2.TLC -workers N -deadlock MC<name>`.
 | MCExplicitTid         | classic TID protocol, TID collision across pidns  | NoCorruption **violated** (the original kernel bug) |
 | MCExplicitOldABI      | pending op attributed via shared entry cookie     | NoCorruption **violated** (why list_op_pending_cookie exists) |
 | MCCounterOK10         | final counter protocol (3 threads, MaxCtr=10: a full cookie wrap + margin) | PASS, exhaustive: 3,511,823,398 states generated, 821,073,870 distinct |
-| MCCounterOKLive       | final counter protocol (2 threads, MaxCtr=12, + liveness) | PASS (incl. Recovery) |
+| MCCounterOKLive       | final counter protocol (2 threads, MaxCtr=12, + liveness) | PASS (incl. Recovery; 18.9M generated / 6.6M distinct) |
 | MCCounterOK           | as OK10 but MaxCtr=12                             | no violation in 6.5e9 generated / 1.66e9 distinct states (search stopped before exhaustion; OK10 is the completed exhaustive bound) |
-| MCCounterNoExitFixup  | no exit time pending fixups (3 threads)           | NoCorruption **violated** (fatal-signal death windows; the fence cannot reach a dead task) |
+| MCCounterNoExitFixup  | no exit time pending fixups (2 threads)           | NoCorruption **violated** (fatal-signal death windows; the fence cannot reach a dead task) |
 | MCCounterOrigDesign   | entry cookie attribution, fence on, no exit fixup | Exclusion **violated** (the design as originally sketched) |
 | MCCounterOldABI       | entry cookie attribution + exit fixups + fence    | Recovery **violated** (a contender overwriting the entry cookie makes a dead owner uncleanable: waiters hang) |
 | MCCounterNoFence      | final ABI, fence disabled                         | PASS (see below) |
@@ -107,15 +127,50 @@ Run: `java -cp tla2tools.jar tlc2.TLC -workers N -deadlock MC<name>`.
    protocol is immune to this chain because its pending op is only ever
    armed inside the vDSO windows covered by the exit fixups.
 
-4. **The model checker earns its keep only if it can fail.** Every
+4. **Waiter recovery is a no-lost-wakeup property, not fairness**
+   (issue #20 of the review). Waiters, the WAITERS bit, FUTEX_WAKE(1)
+   and the cleanup wakes are modeled explicitly, with the woken waiter
+   chosen adversarially. Two protocol mechanisms turned out to be load
+   bearing and get their own broken variants: the kernel wake in the
+   exit cleanup (`MCExplicitNoWake`) and the WAITERS re-assertion by
+   woken acquirers - the kernel robust unlock and cleanup rewrite the
+   whole lock word, so a woken waiter acquiring without re-asserting
+   the bit strands the remaining sleepers once it unlocks through the
+   uncontended fast path (`MCExplicitLostWaiter`; this is the lost
+   waiter bug rfmutex fixes with its `waited` bit). Two modeling
+   lessons: handle_futex_death()'s wake for a pending op whose word is
+   already released must be modeled *unconditionally* (the WAITERS bit
+   may be gone precisely because the robust unlock wiped it), and the
+   futex wait loop must re-assert WAITERS whenever it observes an owned
+   lock (a waiter that could "spin without re-asserting" does not exist
+   in the code and produces spurious strands in the model). Per-waiter
+   starvation freedom is deliberately not claimed: with FUTEX_WAKE(1)
+   and no wake ordering promise, TLC exhibits the classic starvation
+   lasso, which is inherent to futex based locks.
+
+5. **The model checker earns its keep only if it can fail.** Every
    "violated" row above doubles as a validation of the specification's
    abstraction level: the spec finds the historical TID bug, both
    variants of the entry-cookie ABI defect (corruption without exit
-   fixups, robustness loss with them), the exit fixup windows and both
-   cleanup ordering defects.
+   fixups, robustness loss with them), the exit fixup windows, both
+   cleanup ordering defects, the missing cleanup wake and the lost
+   waiter bug.
 
 ## Files
 
 - `ExplicitCookie.tla`, `CounterMutex.tla` — the specifications.
 - `MC*.tla` / `MC*.cfg` — model instances (constants per the matrix).
-- `tla2tools.jar` — TLC 1.8.0 (needs Java 11+).
+- `runs/` — per-run TLC logs produced by `../validate.sh` (which also
+  records tool versions, options and artifact hashes in its manifest).
+- `tla2tools.jar` — bundled TLA+ tools build (needs Java 11+):
+  Implementation-Version "2.0 2026-07-15", upstream master revision
+  227f61b983d0203a06db8184da45aed421e8f1b8, sha256
+  58d44845a37a8d776deaf8cf3a623213b59d311bc0ec287bcdfbe148dd11bb3d
+  (see LICENSE for provenance). Earlier revisions of this README
+  mislabeled it "TLC 1.8.0".
+
+The counter model's waiter-level behavior is intentionally not
+duplicated there: the wait/wake machinery is identical library code for
+both mutex types and is verified in the explicit model; the counter
+model keeps the owner-word-centric `Recovery` property to keep the
+exhaustive wrap-coverage run (3.5e9 states) tractable.

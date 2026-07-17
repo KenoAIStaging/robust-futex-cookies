@@ -1,4 +1,4 @@
-From 2fbe4361307c83b00ce436d87fad90afd48ff347 Mon Sep 17 00:00:00 2001
+From 23f4a2668ddb2e59e83bf4dc7f8f441063bf0d9e Mon Sep 17 00:00:00 2001
 From: Keno Fischer <keno@juliahub.com>
 Date: Thu, 16 Jul 2026 08:19:53 +0000
 Subject: [PATCH 1/6] futex: Add ROBUST_LIST_COOKIE for PID namespace agnostic
@@ -63,8 +63,11 @@ task.
 
 The compat variant gets the identical treatment.
 
+This series was developed with the assistance of Claude (an AI
+assistant by Anthropic); the author reviewed, validated and takes
+responsibility for the changes.
+
 Signed-off-by: Keno Fischer <keno@juliahub.com>
-Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
 
 squash! futex: Add ROBUST_LIST_COOKIE for PID namespace agnostic robust lists
 
@@ -84,21 +87,58 @@ make the list walk use the prefetched value.
 
 TID based lists keep the historical entries-then-pending order; a TID
 cannot be reused before the exiting task is reaped.
+
+squash! futex: Add ROBUST_LIST_COOKIE for PID namespace agnostic robust lists
+
+Tighten the identifier domain and the registration ABI (issue #26):
+the exit cleanup no longer masks the owner identifier, so a cookie with
+bits outside FUTEX_TID_MASK never matches any futex value (fail closed
+instead of aliasing); entries carrying FUTEX_ROBUST_MOD_PI are skipped
+on cookie lists (the kernel cannot resolve a cookie to a task for PI
+ownership); and registration rejects a nonzero __reserved field. The
+valid domain (1..FUTEX_TID_MASK) is documented in the UAPI header and
+the ABI document.
+
+Compute the compat cookie address with 32-bit wrapping semantics like
+the futex word address, via a compat variant of the owner id fetch
+(issue #27).
+
+Publish and snapshot the (head pointer, registration flags) pair
+coherently (issue #28): set_robust_list() passes the pointer through
+NULL so that a concurrent get_robust_list() - which rereads the pointer
+after the flags - can never pair a head with the flags of a different
+registration, even when consecutive registrations reuse the same
+address with different flags.
+
+squash! futex: Add ROBUST_LIST_COOKIE for PID namespace agnostic robust lists
+
+Wake a waiter when discarding a dying task's pending lock operation
+because the lock is owned by someone else: the dying task may be a
+woken waiter which was killed before it could act on its wakeup. The
+robust unlock which woke it wiped the whole futex value including
+FUTEX_WAITERS, so the owner which re-acquired the lock meanwhile will
+unlock through the uncontended fast path and never wake the remaining
+waiters - they would sleep forever. Replaying the consumed wake up
+keeps the chain alive; the woken waiter re-evaluates the futex value
+and re-arms FUTEX_WAITERS before waiting again, so a spurious wake up
+is harmless. (This closes a lost-wakeup window which exists in the
+classic TID based robust list protocol as well; it was found by model
+checking the waiter/wake interactions.)
 ---
- Documentation/locking/robust-futex-ABI.rst |  82 ++++++++++
+ Documentation/locking/robust-futex-ABI.rst |  86 ++++++++
  include/linux/compat.h                     |   8 +
  include/linux/futex_types.h                |   6 +
- include/uapi/linux/futex.h                 |  58 +++++++
- kernel/futex/core.c                        | 171 +++++++++++++++++++--
- kernel/futex/futex.h                       |   9 ++
- kernel/futex/syscalls.c                    |  66 ++++++--
- 7 files changed, 371 insertions(+), 29 deletions(-)
+ include/uapi/linux/futex.h                 |  69 +++++++
+ kernel/futex/core.c                        | 227 +++++++++++++++++++--
+ kernel/futex/futex.h                       |   9 +
+ kernel/futex/syscalls.c                    | 127 ++++++++++--
+ 7 files changed, 495 insertions(+), 37 deletions(-)
 
 diff --git a/Documentation/locking/robust-futex-ABI.rst b/Documentation/locking/robust-futex-ABI.rst
-index 5e6a0665b8ba..5265fdabcd04 100644
+index 5e6a0665b8ba..36a564c87a4b 100644
 --- a/Documentation/locking/robust-futex-ABI.rst
 +++ b/Documentation/locking/robust-futex-ABI.rst
-@@ -226,3 +226,85 @@ depending on the size of the pointer). If the vDSO call succeeds, it means that
+@@ -226,3 +226,89 @@ depending on the size of the pointer). If the vDSO call succeeds, it means that
  it released the lock and cleared ``list_op_pending``. If it fails, that means
  that there are waiters for this lock and a call to ``futex()`` syscall with
  ``FUTEX_ROBUST_UNLOCK`` is needed.
@@ -175,7 +215,11 @@ index 5e6a0665b8ba..5265fdabcd04 100644
 +
 +User space is responsible for assigning cookies which are unique among
 +all tasks which can hold the lock, the same way TIDs are unique among
-+all tasks within one PID namespace. Uniqueness can be organized, for
++all tasks within one PID namespace. The valid cookie domain is
++``1..FUTEX_TID_MASK`` (the owner part of the lock word); an identifier
++with bits outside ``FUTEX_TID_MASK`` never matches and the entry is
++skipped, as are entries carrying the PI modifier bit. The 'flags' and
++'__reserved' fields are validated at registration time. Uniqueness can be organized, for
 +instance, with allocation tables in the shared memory itself (with the
 +allocations guarded by robust futexes on the table slots), with OFD
 +file locks on a shared file, or with per lock reservation counters.
@@ -231,10 +275,10 @@ index d320c0571f0c..d9835ddbafb0 100644
  	struct list_head			pi_state_list;
  	struct futex_pi_state			*pi_state_cache;
 diff --git a/include/uapi/linux/futex.h b/include/uapi/linux/futex.h
-index 10a36c551675..8eb64cc91819 100644
+index 10a36c551675..b64f024a0996 100644
 --- a/include/uapi/linux/futex.h
 +++ b/include/uapi/linux/futex.h
-@@ -179,6 +179,64 @@ struct robust_list_head {
+@@ -179,6 +179,75 @@ struct robust_list_head {
  	struct robust_list __user *list_op_pending;
  };
  
@@ -269,9 +313,18 @@ index 10a36c551675..8eb64cc91819 100644
 +	 * where TIDs are ambiguous, by using user space managed unique
 +	 * cookies as owner identifiers.
 +	 *
++	 * The valid cookie domain is 1..FUTEX_TID_MASK, matching the
++	 * owner part of the futex value. A cookie with bits outside
++	 * FUTEX_TID_MASK set never matches any futex value: the entry is
++	 * skipped by the exit cleanup (fail closed) instead of aliasing a
++	 * valid identifier. A cookie of 0 means "unlocked" and never
++	 * matches an owned futex either.
++	 *
 +	 * The entry cookie is only ever written by the lock owner, after
 +	 * the lock word has been acquired and before the entry is queued
-+	 * in the list.
++	 * in the list. Entries carrying FUTEX_ROBUST_MOD_PI are invalid
++	 * on a cookie list (the kernel cannot resolve a cookie to a task
++	 * for PI ownership) and are skipped by the exit cleanup.
 +	 */
 +	long cookie_offset;
 +
@@ -290,6 +343,8 @@ index 10a36c551675..8eb64cc91819 100644
 +	 * set before list_op_pending is armed.
 +	 */
 +	__u32 list_op_pending_cookie;
++
++	/* Must be 0, registration fails with -EINVAL otherwise */
 +	__u32 __reserved;
 +};
 +
@@ -300,18 +355,22 @@ index 10a36c551675..8eb64cc91819 100644
   * Are there any waiters for this robust futex:
   */
 diff --git a/kernel/futex/core.c b/kernel/futex/core.c
-index 179b26e9c934..510a1619b627 100644
+index 179b26e9c934..96638872ebae 100644
 --- a/kernel/futex/core.c
 +++ b/kernel/futex/core.c
-@@ -964,13 +964,17 @@ void futex_unqueue_pi(struct futex_q *q)
+@@ -964,13 +964,21 @@ void futex_unqueue_pi(struct futex_q *q)
  /*
   * Process a futex-list entry, check whether it's owned by the
   * dying task, and do notification if so:
 + *
 + * @owner_id is the value against which the owner part (FUTEX_TID_MASK) of
-+ * the futex value is compared: the TID of the exiting task or, for entries
-+ * with FUTEX_ROBUST_MOD_COOKIE set on a ROBUST_LIST_COOKIE enabled list,
-+ * the user space provided cookie of the entry.
++ * the futex value is compared: the TID of the exiting task or, on a
++ * ROBUST_LIST_COOKIE enabled list, the user space provided cookie of the
++ * entry (resp. robust_list_head2::list_op_pending_cookie for the pending
++ * op). The valid identifier domain is 1..FUTEX_TID_MASK; @owner_id is
++ * deliberately not masked, so an out of domain identifier never matches
++ * any futex value and the entry is skipped (fail closed) instead of
++ * aliasing a valid owner.
   */
  static int handle_futex_death(u32 __user *uaddr, struct task_struct *curr,
 -			      unsigned int mod, bool pending_op)
@@ -324,16 +383,34 @@ index 179b26e9c934..510a1619b627 100644
  	int err;
  
  	/* Futex address must be 32bit aligned */
-@@ -1025,7 +1029,7 @@ static int handle_futex_death(u32 __user *uaddr, struct task_struct *curr,
+@@ -1025,8 +1033,25 @@ static int handle_futex_death(u32 __user *uaddr, struct task_struct *curr,
  		return 0;
  	}
  
 -	if (owner != task_pid_vnr(curr))
-+	if (owner != (owner_id & FUTEX_TID_MASK))
++	if (owner != owner_id) {
++		/*
++		 * The dying task's pending op may have consumed the wake up
++		 * notification of a robust unlock: woken, then killed before
++		 * it could act on it. The robust unlock wiped the whole
++		 * futex value including FUTEX_WAITERS, so the owner which
++		 * re-acquired the lock afterwards will unlock through the
++		 * uncontended fast path and never wake the remaining
++		 * waiters. Nothing may be modified here - the lock has a
++		 * live owner - but a potential waiter must be woken to keep
++		 * the wake up chain alive. The woken waiter re-evaluates
++		 * the futex value and re-arms FUTEX_WAITERS before waiting
++		 * again, so a spurious wake up is harmless.
++		 */
++		if (pending_op && !pi)
++			futex_wake(uaddr, FLAGS_SIZE_32 | FLAGS_SHARED, NULL, 1,
++				   FUTEX_BITSET_MATCH_ANY);
  		return 0;
++	}
  
  	/*
-@@ -1099,6 +1103,28 @@ static inline int fetch_robust_entry(struct robust_list __user **entry,
+ 	 * Ok, this dying thread is truly holding a futex
+@@ -1099,6 +1124,28 @@ static inline int fetch_robust_entry(struct robust_list __user **entry,
  	return 0;
  }
  
@@ -362,7 +439,7 @@ index 179b26e9c934..510a1619b627 100644
  /*
   * Walk curr->futex.robust_list (very carefully, it's a userspace list!)
   * and mark any locks found there dead, and notify any waiters.
-@@ -1110,9 +1136,30 @@ static void exit_robust_list(struct task_struct *curr)
+@@ -1110,9 +1157,30 @@ static void exit_robust_list(struct task_struct *curr)
  	struct robust_list_head __user *head = curr->futex.robust_list;
  	unsigned int limit = ROBUST_LIST_LIMIT, cur_mod, next_mod, pend_mod;
  	struct robust_list __user *entry, *next_entry, *pending;
@@ -393,7 +470,7 @@ index 179b26e9c934..510a1619b627 100644
  	/*
  	 * Fetch the list head (which was registered earlier, via
  	 * sys_set_robust_list()):
-@@ -1131,20 +1178,65 @@ static void exit_robust_list(struct task_struct *curr)
+@@ -1131,20 +1199,70 @@ static void exit_robust_list(struct task_struct *curr)
  	if (fetch_robust_entry(&pending, &head->list_op_pending, &pend_mod))
  		return;
  
@@ -423,9 +500,10 @@ index 179b26e9c934..510a1619b627 100644
 +		pending_next_rc = fetch_robust_entry(&pending_next,
 +						     &pending->next,
 +						     &pending_next_mod);
-+		handle_futex_death((void __user *)pending + futex_offset,
-+				   curr, pend_mod, HANDLE_DEATH_PENDING,
-+				   pending_cookie);
++		if (!(pend_mod & FUTEX_ROBUST_MOD_PI))
++			handle_futex_death((void __user *)pending + futex_offset,
++					   curr, pend_mod, HANDLE_DEATH_PENDING,
++					   pending_cookie);
 +		pending_handled = true;
 +	}
 +
@@ -449,9 +527,15 @@ index 179b26e9c934..510a1619b627 100644
 +		}
  		/*
  		 * A pending lock might already be on the list, so
- 		 * don't process it twice:
+-		 * don't process it twice:
++		 * don't process it twice. Kernel side PI ownership
++		 * cannot work with cookie identifiers (the kernel
++		 * cannot resolve a cookie to a task), so PI marked
++		 * entries on a cookie list are skipped (fail closed):
  		 */
- 		if (entry != pending) {
+-		if (entry != pending) {
++		if (entry != pending &&
++		    !(cookies && (cur_mod & FUTEX_ROBUST_MOD_PI))) {
 +			if (fetch_robust_owner_id(entry, cookies, cookie_offset,
 +						  tid, &owner_id))
 +				return;
@@ -462,7 +546,7 @@ index 179b26e9c934..510a1619b627 100644
  				return;
  		}
  		if (rc)
-@@ -1160,9 +1252,10 @@ static void exit_robust_list(struct task_struct *curr)
+@@ -1160,9 +1278,10 @@ static void exit_robust_list(struct task_struct *curr)
  		cond_resched();
  	}
  
@@ -475,7 +559,31 @@ index 179b26e9c934..510a1619b627 100644
  	}
  }
  
-@@ -1224,10 +1317,27 @@ static void compat_exit_robust_list(struct task_struct *curr)
+@@ -1197,6 +1316,23 @@ static void __user *futex_uaddr(struct robust_list __user *entry,
+ 	return uaddr;
+ }
+ 
++/*
++ * Compat variant of fetch_robust_owner_id(): the cookie address must be
++ * computed with 32-bit wrapping semantics, exactly like futex_uaddr()
++ * computes the futex word address.
++ */
++static inline int compat_fetch_robust_owner_id(struct robust_list __user *entry,
++					       bool cookies,
++					       compat_long_t cookie_offset,
++					       u32 tid, u32 *owner_id)
++{
++	if (likely(!cookies)) {
++		*owner_id = tid;
++		return 0;
++	}
++	return get_user(*owner_id, (u32 __user *)futex_uaddr(entry, cookie_offset));
++}
++
+ /*
+  * Fetch a robust-list pointer. Bit 0 signals PI futexes:
+  */
+@@ -1224,10 +1360,27 @@ static void compat_exit_robust_list(struct task_struct *curr)
  	struct compat_robust_list_head __user *head = current->futex.compat_robust_list;
  	unsigned int limit = ROBUST_LIST_LIMIT, cur_mod, next_mod, pend_mod;
  	struct robust_list __user *entry, *next_entry, *pending;
@@ -504,7 +612,7 @@ index 179b26e9c934..510a1619b627 100644
  	/*
  	 * Fetch the list head (which was registered earlier, via
  	 * sys_set_robust_list()):
-@@ -1246,14 +1356,35 @@ static void compat_exit_robust_list(struct task_struct *curr)
+@@ -1246,22 +1399,52 @@ static void compat_exit_robust_list(struct task_struct *curr)
  	if (compat_fetch_robust_entry(&upending, &pending, &head->list_op_pending, &pend_mod))
  		return;
  
@@ -516,8 +624,10 @@ index 179b26e9c934..510a1619b627 100644
 +				&pending_next,
 +				(compat_uptr_t __user *)&pending->next,
 +				&pending_next_mod);
-+		handle_futex_death(uaddr, curr, pend_mod, HANDLE_DEATH_PENDING,
-+				   pending_cookie);
++		if (!(pend_mod & FUTEX_ROBUST_MOD_PI))
++			handle_futex_death(uaddr, curr, pend_mod,
++					   HANDLE_DEATH_PENDING,
++					   pending_cookie);
 +		pending_handled = true;
 +	}
 +
@@ -542,21 +652,26 @@ index 179b26e9c934..510a1619b627 100644
 +		}
  		/*
  		 * A pending lock might already be on the list, so
- 		 * dont process it twice:
-@@ -1261,7 +1392,11 @@ static void compat_exit_robust_list(struct task_struct *curr)
- 		if (entry != pending) {
+-		 * dont process it twice:
++		 * dont process it twice. See exit_robust_list() about
++		 * PI marked entries on cookie lists:
+ 		 */
+-		if (entry != pending) {
++		if (entry != pending &&
++		    !(cookies && (cur_mod & FUTEX_ROBUST_MOD_PI))) {
  			void __user *uaddr = futex_uaddr(entry, futex_offset);
  
 -			if (handle_futex_death(uaddr, curr, cur_mod, HANDLE_DEATH_LIST))
-+			if (fetch_robust_owner_id(entry, cookies, cookie_offset,
-+						  tid, &owner_id))
++			if (compat_fetch_robust_owner_id(entry, cookies,
++							 cookie_offset, tid,
++							 &owner_id))
 +				return;
 +			if (handle_futex_death(uaddr, curr, cur_mod, HANDLE_DEATH_LIST,
 +					       owner_id))
  				return;
  		}
  		if (rc)
-@@ -1277,10 +1412,11 @@ static void compat_exit_robust_list(struct task_struct *curr)
+@@ -1277,10 +1460,11 @@ static void compat_exit_robust_list(struct task_struct *curr)
  
  		cond_resched();
  	}
@@ -570,7 +685,7 @@ index 179b26e9c934..510a1619b627 100644
  	}
  }
  
-@@ -1419,6 +1555,7 @@ void __futex_fixup_robust_unlock(struct pt_regs *regs, struct futex_unlock_cs_ra
+@@ -1419,6 +1603,7 @@ void __futex_fixup_robust_unlock(struct pt_regs *regs, struct futex_unlock_cs_ra
  
  	futex_robust_list_clear_pending(pop, csr->pop_size32 ? FLAGS_ROBUST_LIST32 : 0);
  }
@@ -578,7 +693,7 @@ index 179b26e9c934..510a1619b627 100644
  #endif /* CONFIG_FUTEX_ROBUST_UNLOCK */
  
  static void futex_cleanup(struct task_struct *tsk)
-@@ -1426,12 +1563,14 @@ static void futex_cleanup(struct task_struct *tsk)
+@@ -1426,12 +1611,14 @@ static void futex_cleanup(struct task_struct *tsk)
  	if (unlikely(tsk->futex.robust_list)) {
  		exit_robust_list(tsk);
  		tsk->futex.robust_list = NULL;
@@ -614,10 +729,10 @@ index f00f0863ed44..77d7a09fe5b9 100644
  static inline unsigned int futex_to_flags(unsigned int op)
  {
 diff --git a/kernel/futex/syscalls.c b/kernel/futex/syscalls.c
-index 2fa19d9d008d..487326330736 100644
+index 2fa19d9d008d..4901b303c9c1 100644
 --- a/kernel/futex/syscalls.c
 +++ b/kernel/futex/syscalls.c
-@@ -24,27 +24,48 @@
+@@ -24,27 +24,92 @@
   * sys_set_robust_list() - Set the robust-futex list head of a task
   * @head:	pointer to the list-head
   * @len:	length of the list-head, as userspace expects
@@ -637,6 +752,7 @@ index 2fa19d9d008d..487326330736 100644
 +	if (unlikely(len != sizeof(*head))) {
 +		struct robust_list_head2 __user *head2 = (void __user *)head;
 +		unsigned long uflags;
++		u32 reserved;
 +
 +		if (len != sizeof(*head2))
 +			return -EINVAL;
@@ -644,27 +760,73 @@ index 2fa19d9d008d..487326330736 100644
 +			return -EFAULT;
 +		if (uflags & ~FUTEX_RLIST_VALID_FLAGS)
 +			return -EINVAL;
++		if (get_user(reserved, &head2->__reserved))
++			return -EFAULT;
++		if (reserved)
++			return -EINVAL;
 +		rflags = (unsigned int)uflags | FUTEX_RLIST_V2;
 +	}
  
- 	current->futex.robust_list = head;
-+	current->futex.robust_list_flags = rflags;
+-	current->futex.robust_list = head;
++	/*
++	 * A concurrent get_robust_list() must never pair this head with
++	 * the flags of a different registration. Passing the pointer
++	 * through NULL makes the reader's pointer recheck detect the
++	 * update even when consecutive registrations reuse the same
++	 * address with different flags (v1 <-> v2 of the same head).
++	 * See futex_task_robust_list().
++	 */
++	WRITE_ONCE(current->futex.robust_list, NULL);
++	smp_wmb();
++	WRITE_ONCE(current->futex.robust_list_flags, rflags);
++	smp_wmb();
++	WRITE_ONCE(current->futex.robust_list, head);
  	return 0;
  }
  
 -static inline void __user *futex_task_robust_list(struct task_struct *p, bool compat)
++/*
++ * Snapshot a (head pointer, registration flags) pair coherently against
++ * a concurrent set_robust_list() of @p: the pointer is reread after the
++ * flags and the flags only accepted when the pointer did not change.
++ * The writer passes the pointer through NULL (see sys_set_robust_list()),
++ * so a registration switching the flags of the *same* head address is
++ * detected as well. A NULL head has no flags to pair with, so it is
++ * returned immediately.
++ */
 +static inline void __user *futex_task_robust_list(struct task_struct *p, bool compat,
 +						  unsigned int *rflags)
  {
++	void __user *head, *again;
++
++	for (;;) {
  #ifdef CONFIG_COMPAT
 -	if (compat)
-+	if (compat) {
-+		*rflags = p->futex.compat_robust_list_flags;
- 		return p->futex.compat_robust_list;
-+	}
+-		return p->futex.compat_robust_list;
++		if (compat) {
++			head = READ_ONCE(p->futex.compat_robust_list);
++			smp_rmb();
++			*rflags = READ_ONCE(p->futex.compat_robust_list_flags);
++			smp_rmb();
++			again = READ_ONCE(p->futex.compat_robust_list);
++		} else
  #endif
-+	*rflags = p->futex.robust_list_flags;
- 	return p->futex.robust_list;
+-	return p->futex.robust_list;
++		{
++			head = READ_ONCE(p->futex.robust_list);
++			smp_rmb();
++			*rflags = READ_ONCE(p->futex.robust_list_flags);
++			smp_rmb();
++			again = READ_ONCE(p->futex.robust_list);
++		}
++		if (!head) {
++			*rflags = 0;
++			return NULL;
++		}
++		if (head == again)
++			return head;
++		cpu_relax();
++	}
  }
  
 -static void __user *futex_get_robust_list_common(int pid, bool compat)
@@ -672,7 +834,7 @@ index 2fa19d9d008d..487326330736 100644
  {
  	struct task_struct *p = current;
  	void __user *head;
-@@ -71,7 +92,7 @@ static void __user *futex_get_robust_list_common(int pid, bool compat)
+@@ -71,7 +136,7 @@ static void __user *futex_get_robust_list_common(int pid, bool compat)
  	if (!ptrace_may_access(p, PTRACE_MODE_READ_REALCREDS))
  		goto err_unlock;
  
@@ -681,7 +843,7 @@ index 2fa19d9d008d..487326330736 100644
  
  	up_read(&p->signal->exec_update_lock);
  	put_task_struct(p);
-@@ -95,12 +116,14 @@ SYSCALL_DEFINE3(get_robust_list, int, pid,
+@@ -95,12 +160,14 @@ SYSCALL_DEFINE3(get_robust_list, int, pid,
  		struct robust_list_head __user * __user *, head_ptr,
  		size_t __user *, len_ptr)
  {
@@ -698,7 +860,7 @@ index 2fa19d9d008d..487326330736 100644
  		return -EFAULT;
  	return put_user(head, head_ptr);
  }
-@@ -481,10 +504,23 @@ SYSCALL_DEFINE4(futex_requeue,
+@@ -481,10 +548,32 @@ SYSCALL_DEFINE4(futex_requeue,
  COMPAT_SYSCALL_DEFINE2(set_robust_list, struct compat_robust_list_head __user *, head,
  		       compat_size_t, len)
  {
@@ -709,6 +871,7 @@ index 2fa19d9d008d..487326330736 100644
 +	if (unlikely(len != sizeof(*head))) {
 +		struct compat_robust_list_head2 __user *head2 = (void __user *)head;
 +		compat_ulong_t uflags;
++		u32 reserved;
 +
 +		if (len != sizeof(*head2))
 +			return -EINVAL;
@@ -716,15 +879,24 @@ index 2fa19d9d008d..487326330736 100644
 +			return -EFAULT;
 +		if (uflags & ~FUTEX_RLIST_VALID_FLAGS)
 +			return -EINVAL;
++		if (get_user(reserved, &head2->__reserved))
++			return -EFAULT;
++		if (reserved)
++			return -EINVAL;
 +		rflags = (unsigned int)uflags | FUTEX_RLIST_V2;
 +	}
  
- 	current->futex.compat_robust_list = head;
-+	current->futex.compat_robust_list_flags = rflags;
+-	current->futex.compat_robust_list = head;
++	/* See sys_set_robust_list() about the coherent publication */
++	WRITE_ONCE(current->futex.compat_robust_list, NULL);
++	smp_wmb();
++	WRITE_ONCE(current->futex.compat_robust_list_flags, rflags);
++	smp_wmb();
++	WRITE_ONCE(current->futex.compat_robust_list, head);
  	return 0;
  }
  
-@@ -492,12 +528,16 @@ COMPAT_SYSCALL_DEFINE3(get_robust_list, int, pid,
+@@ -492,12 +581,16 @@ COMPAT_SYSCALL_DEFINE3(get_robust_list, int, pid,
  			compat_uptr_t __user *, head_ptr,
  			compat_size_t __user *, len_ptr)
  {

@@ -1,4 +1,4 @@
-From a5c6bcc82ab50a7ad0180a46c819da837c24d6e9 Mon Sep 17 00:00:00 2001
+From 15db64540dc55e392cdb1b93ca1f1dba7bf60d09 Mon Sep 17 00:00:00 2001
 From: Keno Fischer <keno@juliahub.com>
 Date: Thu, 16 Jul 2026 08:22:51 +0000
 Subject: [PATCH 4/6] selftests/futex: Add tests for the VDSO robust cmpxchg
@@ -25,14 +25,29 @@ The tests register their own rseq TLS area and fall back to the glibc
 provided registration via __rseq_offset on libcs which register rseq on
 their own.
 
+This series was developed with the assistance of Claude (an AI
+assistant by Anthropic); the author reviewed, validated and takes
+responsibility for the changes.
+
 Signed-off-by: Keno Fischer <keno@juliahub.com>
-Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+
+squash! selftests/futex: Add tests for the VDSO robust cmpxchg RSEQ operations
+
+Add fatal-signal stress coverage for the exit time fixups (issue #31):
+children run a tight VDSO lock/unlock loop against the registered
+robust list head and are SIGKILLed at pseudo-random points; after every
+death the lock word must be released or FUTEX_OWNER_DIED, never left
+owned by the dead child. The critical windows cannot be reached
+deterministically: any ptrace or breakpoint stop inside them triggers
+the RSEQ abort fixup by design, which is exactly why the fatal-signal
+path needs the exit time fixups (their necessity under identifier reuse
+is established by the TLA+ model).
 ---
- .../selftests/futex/functional/robust_list.c  | 410 ++++++++++++++++++
- 1 file changed, 410 insertions(+)
+ .../selftests/futex/functional/robust_list.c  | 521 ++++++++++++++++++
+ 1 file changed, 521 insertions(+)
 
 diff --git a/tools/testing/selftests/futex/functional/robust_list.c b/tools/testing/selftests/futex/functional/robust_list.c
-index 120968f140b1..e0c2d30d05a2 100644
+index 190fbc74923b..8380078b1970 100644
 --- a/tools/testing/selftests/futex/functional/robust_list.c
 +++ b/tools/testing/selftests/futex/functional/robust_list.c
 @@ -30,6 +30,7 @@
@@ -51,7 +66,7 @@ index 120968f140b1..e0c2d30d05a2 100644
  #include <sys/wait.h>
  
  #define STACK_SIZE (1024 * 1024)
-@@ -1592,4 +1594,412 @@ TEST(test_pending_fault)
+@@ -1605,4 +1607,523 @@ TEST(test_pending_fault)
  	ksft_test_result_pass("%s\n", __func__);
  }
  
@@ -461,6 +476,117 @@ index 120968f140b1..e0c2d30d05a2 100644
 +		       io.success, io.aborts);
 +	ASSERT_GT(io.success, 0);
 +	ASSERT_GT(io.aborts, 0);
++}
++
++/*
++ * Fatal-signal coverage for the exit time fixups of the VDSO critical
++ * windows (an uncommitted cmpxchg and a committed try_unlock with the
++ * pending op still armed). The windows cannot be reached under ptrace:
++ * every stop event inside them triggers the RSEQ abort fixup by design,
++ * which is exactly why only the fatal-signal path needs the exit time
++ * fixups. So this is a stress test: children run a tight VDSO
++ * lock/unlock loop against the *registered* robust list head (both the
++ * signal time and the exit time fixups then operate on the real
++ * list_op_pending slot) and are SIGKILLed at pseudo-random points.
++ * After every death the lock word must be in a recoverable state -
++ * either released or marked FUTEX_OWNER_DIED - never left owned by the
++ * dead child.
++ *
++ * Note the fixups' *necessity* (misattribution after identifier reuse)
++ * is not observable here: it requires a reuse racing the exit walk,
++ * see the TLA+ model. This test provides execution coverage of the
++ * fixup paths and the recoverability guarantee.
++ */
++#define FIXUP_KILL_ITERS	150
++
++struct fixup_kill_region {
++	struct lock_struct2		lock;
++	struct robust_list_head2	head2;
++	_Atomic(int)			ready;
++};
++
++typedef uint32_t (*cmpxchg64_fn)(void *pending_ptr, uint64_t pending,
++				 _Atomic(uint32_t) *lock, uint32_t expect,
++				 uint32_t set, volatile struct rseq_abi *rseq);
++typedef uint32_t (*unlock64_fn)(_Atomic(uint32_t) *lock, uint32_t tid,
++				void *pending_ptr);
++
++static cmpxchg64_fn fixup_kill_cmpxchg;
++static unlock64_fn fixup_kill_unlock;
++
++static int child_fn_fixup_kill(void *arg)
++{
++	struct fixup_kill_region *r = arg;
++	uint64_t entry = (uint64_t)(uintptr_t)&r->lock.list;
++
++	/* A CLONE_VM child starts with no RSEQ registration */
++	if (syscall(SYS_rseq, &own_rseq, sizeof(own_rseq), 0, RSEQ_SIG))
++		return 1;
++	if (set_list2(&r->head2, ROBUST_LIST_COOKIE))
++		return 1;
++	r->head2.list_op_pending_cookie = TEST_COOKIE;
++
++	atomic_store(&r->ready, 1);
++	for (;;) {
++		own_rseq.rseq_cs = (uintptr_t)&empty_cs;
++		if (fixup_kill_cmpxchg(&r->head2.head.list_op_pending, entry,
++				       &r->lock.futex, 0, TEST_COOKIE,
++				       &own_rseq)) {
++			own_rseq.rseq_cs = 0;
++			/*
++			 * Unlock immediately, without queueing the entry:
++			 * this maximizes the density of the two fixup
++			 * windows in the loop.
++			 */
++			fixup_kill_unlock(&r->lock.futex, TEST_COOKIE,
++					  &r->head2.head.list_op_pending);
++		} else {
++			own_rseq.rseq_cs = 0;
++		}
++	}
++	return 0;
++}
++
++TEST(test_vdso_fixup_fatal_signal)
++{
++	struct fixup_kill_region *r;
++	int it, pid, wstatus;
++	unsigned int w;
++
++	fixup_kill_cmpxchg = get_vdso_func_addr("__vdso_futex_robust_list64_cmpxchg_rseq");
++	fixup_kill_unlock = get_vdso_func_addr("__vdso_futex_robust_list64_try_unlock");
++	if (!fixup_kill_cmpxchg || !fixup_kill_unlock)
++		SKIP(return, "VDSO cmpxchg/try_unlock helpers not found");
++
++	r = mmap(NULL, sizeof(*r), PROT_READ | PROT_WRITE,
++		 MAP_SHARED | MAP_ANONYMOUS, -1, 0);
++	ASSERT_NE(r, MAP_FAILED);
++
++	for (it = 0; it < FIXUP_KILL_ITERS; it++) {
++		memset(r, 0, sizeof(*r));
++
++		pid = create_child(child_fn_fixup_kill, r);
++		ASSERT_NE(pid, -1);
++
++		while (!atomic_load(&r->ready))
++			;
++		usleep((it * 37) % 3000);
++		ASSERT_EQ(kill(pid, SIGKILL), 0);
++		ASSERT_EQ(waitpid(pid, &wstatus, 0), pid);
++		ASSERT_TRUE(WIFSIGNALED(wstatus) && WTERMSIG(wstatus) == SIGKILL);
++
++		/*
++		 * The lock must never remain owned by the dead child:
++		 * either it was released (0, potentially with a stale
++		 * WAITERS bit from the kernel wake path) or the exit
++		 * cleanup marked it recoverable.
++		 */
++		w = atomic_load(&r->lock.futex) & ~FUTEX_WAITERS;
++		ASSERT_TRUE(w == 0 || w == FUTEX_OWNER_DIED);
++	}
++
++	munmap(r, sizeof(*r));
++	ksft_test_result_pass("%s\n", __func__);
 +}
 +
  TEST_HARNESS_MAIN
