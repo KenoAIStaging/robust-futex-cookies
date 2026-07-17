@@ -5,9 +5,15 @@ benchmarks and TLA+ verification for making **robust futexes work across
 PID namespaces** by replacing the TID in the lock word with a user space
 managed **owner cookie**.
 
-The kernel series (6 patches, `patches/`) applies on top of mainline
+The kernel series (8 patches, `patches/`) applies on top of mainline
 after the 7.2 `FUTEX_ROBUST_UNLOCK`/vDSO robust-unlock work and adds:
 
+0. A standalone fix (patches 1-2, independently applicable): the exit
+   time robust list walk now replays the wakeup a dying waiter may
+   have consumed. A robust unlock wipes `FUTEX_WAITERS` and wakes one
+   waiter; if that waiter is killed before acting on the wakeup while
+   a third task re-acquired the futex, the remaining waiters slept
+   forever on current kernels (deterministic reproducer in `repro/`).
 1. `ROBUST_LIST_COOKIE` — an extensible robust list head
    (`struct robust_list_head2`, selected by size) which makes the exit
    time cleanup compare the futex word against per-entry cookies and a
@@ -110,11 +116,16 @@ cookies for POSIX mutexes without global coordination, is the new part.
 
 ## Verification
 
-- Kernel selftests: 36 futex tests (including a live PID namespace
-  corruption reproducer and its cookie-based fix, plus exit-walk
-  ordering tests which demonstrably fail on a kernel without the
-  pending-before-entries cleanup order) and 4 membarrier tests, run
-  under QEMU.
+- Kernel selftests: 38 futex tests (including a live PID namespace
+  corruption reproducer and its cookie-based fix, exit-walk ordering
+  tests which demonstrably fail on a kernel without the
+  pending-before-entries cleanup order, and the classic-protocol
+  lost wakeup test of patch 2, which demonstrably fails on an
+  unfixed kernel) and 4 membarrier tests, run under QEMU.
+- `repro/robust_lost_wakeup.c`: a standalone reproducer for the lost
+  wakeup fixed by patch 1 - the waiter times out (would hang forever)
+  on unfixed kernels, verified against the unfixed 6.8 host kernel,
+  and is woken on the patched kernel under QEMU.
 - `rfmutex` (in `lib/`): mutual exclusion, cross PID namespace and
   SIGKILL stress tests with EOWNERDEAD recovery for all three cookie
   assignment schemes, plus lifecycle tests (concurrent first attach,
@@ -124,11 +135,11 @@ cookies for POSIX mutexes without global coordination, is the new part.
   passes exhaustively (3 threads, full cookie wrap: 3.5e9 states) and
   the specifications demonstrably catch seven distinct broken variants,
   including the historical TID bug and both exit-walk ordering defects.
-  Model checking found three genuine bugs during development: two exit
-  fixup windows (fixed in patch 3) and, during the post-review rework,
-  the requirement that the cookie lease entry is walked last (patch 1's
-  pending-first order plus a documented user space list order
-  obligation).
+  Model checking found four genuine bugs during development: two exit
+  fixup windows (fixed in patch 5), the requirement that the cookie
+  lease entry is walked last (patch 3's pending-first order plus a
+  documented user space list order obligation) and the classic
+  protocol lost wakeup fixed by the standalone patch 1.
 - Benchmarks vs. pthread mutexes in `bench/RESULTS.md`.
 
 ## Repository layout
@@ -149,10 +160,11 @@ cookies for POSIX mutexes without global coordination, is the new part.
   stress (EOWNERDEAD recovery) and counter generation tests.
 - `bench/` — benchmarks vs. pthread mutexes; results in
   `bench/RESULTS.md`.
+- `repro/` — the standalone lost wakeup reproducer (see
+  Verification above); built and run by `validate.sh`.
 - `tla/` — TLA+ specifications, model instances and results; see
-  `tla/README.md`. The models found two genuine bugs during
-  development (both fixed in kernel patch 3) and validate the final
-  design.
+  `tla/README.md`. The models found genuine bugs during development
+  (fixed in kernel patches 1 and 5) and validate the final design.
 - `harness/` — QEMU/initramfs test harness:
   - `mkinitramfs.sh run.sh file...` builds a busybox+glibc initramfs
     with the given files under `/tests`.
@@ -192,7 +204,7 @@ Individual pieces (all paths overridable, see each script's header):
     ./harness/mkinitramfs.sh initramfs/run-all.sh \
         "$KSRC/tools/testing/selftests/futex/functional/robust_list" \
         "$KSRC/tools/testing/selftests/membarrier/membarrier_shared_rseq_test" \
-        lib/test_rfmutex
+        lib/test_rfmutex repro/robust_lost_wakeup
     ./harness/runqemu.sh -c "$(nproc)" -t 900 -k "$KBUILD/arch/x86/boot/bzImage"
 
     # model checking (single configuration)

@@ -89,7 +89,7 @@ artifact provenance).
    counterexample (death between a committed vdso unlock and the
    pending disarm) against a design believed correct; a second window
    (death inside the cmpxchg helper before commit) was found during
-   model construction. Both are fixed in kernel patch 3 by applying the
+   model construction. Both are fixed in kernel patch 5 by applying the
    signal delivery fixups against the dead task's register frame before
    the exit walk. Identifiers that are unique among live tasks (TIDs,
    registry/OFD cookies) are immune, because they cannot be reused
@@ -148,7 +148,12 @@ artifact provenance).
    in the code and produces spurious strands in the model). Per-waiter
    starvation freedom is deliberately not claimed: with FUTEX_WAKE(1)
    and no wake ordering promise, TLC exhibits the classic starvation
-   lasso, which is inherent to futex based locks.
+   lasso, which is inherent to futex based locks. The owner-mismatch
+   wake replay this modeling demanded turned out not to be cookie
+   specific: the identical lost wakeup window exists in the classic
+   TID protocol, so the fix is split out as standalone series patch 1
+   (with a reproducer in `../repro/` which times out on current
+   kernels).
 
 5. **The model checker earns its keep only if it can fail.** Every
    "violated" row above doubles as a validation of the specification's

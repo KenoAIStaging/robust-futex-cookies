@@ -1,4 +1,3 @@
-\* SPDX-License-Identifier: MIT
 #!/bin/bash
 # SPDX-License-Identifier: MIT
 #
@@ -81,12 +80,15 @@ step "membarrier selftests" env -C "$KSRC/tools/testing/selftests/membarrier" \
     PATH=/usr/bin:/bin:$PATH CC="$CC" make -s KHDR_INCLUDES=-I"$KBUILD/usr/include"
 step "rfmutex library + bench" make -s -C "$HERE/lib" clean all \
     CC="$CC" KHDR="$KBUILD/usr/include"
+step "lost wakeup reproducer" "$CC" -O2 -Wall -Wextra \
+    -o "$HERE/repro/robust_lost_wakeup" "$HERE/repro/robust_lost_wakeup.c"
 
 # --- 3. QEMU test run ----------------------------------------------------
 step "initramfs" "$HERE/harness/mkinitramfs.sh" "$HERE/initramfs/run-all.sh" \
     "$KSRC/tools/testing/selftests/futex/functional/robust_list" \
     "$KSRC/tools/testing/selftests/membarrier/membarrier_shared_rseq_test" \
-    "$HERE/lib/test_rfmutex"
+    "$HERE/lib/test_rfmutex" \
+    "$HERE/repro/robust_lost_wakeup"
 note "initramfs sha256: $(sha256sum "$HERE/initramfs/initramfs.cpio.gz" | cut -d' ' -f1)"
 step "QEMU guest tests" "$HERE/harness/runqemu.sh" -c "$(nproc)" -t 900
 
