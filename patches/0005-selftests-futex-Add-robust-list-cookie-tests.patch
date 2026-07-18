@@ -1,7 +1,7 @@
-From 9a6ab4d77ffd3ce1bee10b3f97f0d4fbb35fe2e9 Mon Sep 17 00:00:00 2001
+From f546e598a49dedd7e69ea7611fe05afe93f846dd Mon Sep 17 00:00:00 2001
 From: Keno Fischer <keno@juliahub.com>
 Date: Thu, 16 Jul 2026 08:20:22 +0000
-Subject: [PATCH 4/8] selftests/futex: Add robust list cookie tests
+Subject: [PATCH 5/9] selftests/futex: Add robust list cookie tests
 
 Exercise the ROBUST_LIST_COOKIE extension:
 
@@ -13,11 +13,13 @@ Exercise the ROBUST_LIST_COOKIE extension:
     woken.
 
   - Exit time cleanup with mismatched cookies: a futex which appears to
-    be owned by somebody else must be left untouched, and the waiting
-    parent - which armed FUTEX_WAITERS before sleeping - times out for
-    both a mismatched queued entry (never woken) and a mismatched
-    pending op (the armed bit keeps the wakeup chain intact, so the
-    consumed-wakeup replay must not fire).
+    be owned by somebody else must be left untouched. A mismatched
+    queued entry wakes nobody and the waiting parent times out. A
+    mismatched pending op replays the possibly consumed wakeup by
+    default - the parent is woken spuriously even though it armed
+    FUTEX_WAITERS - while a dying child registered with
+    ROBUST_LIST_WAITERS_STRICT suppresses the replay on the armed bit
+    and the parent times out.
 
   - The pending-before-entries cleanup order: a cookie lease reuse ABA
     reproducer (a lease slot released mid-walk while the parent reuses
@@ -43,11 +45,11 @@ responsibility for the changes.
 
 Signed-off-by: Keno Fischer <keno@juliahub.com>
 ---
- .../selftests/futex/functional/robust_list.c  | 824 +++++++++++++++++-
- 1 file changed, 821 insertions(+), 3 deletions(-)
+ .../selftests/futex/functional/robust_list.c  | 849 +++++++++++++++++-
+ 1 file changed, 846 insertions(+), 3 deletions(-)
 
 diff --git a/tools/testing/selftests/futex/functional/robust_list.c b/tools/testing/selftests/futex/functional/robust_list.c
-index 6a53ce0533be..508541010f61 100644
+index 75d1858c511b..5b9300480702 100644
 --- a/tools/testing/selftests/futex/functional/robust_list.c
 +++ b/tools/testing/selftests/futex/functional/robust_list.c
 @@ -41,9 +41,13 @@
@@ -80,7 +82,7 @@ index 6a53ce0533be..508541010f61 100644
  	ASSERT_EQ(ret, -1);
  	ASSERT_EQ(errno, EINVAL);
  
-@@ -932,4 +941,813 @@ TEST_F(futex_op, test_futex_robust_unlock)
+@@ -931,4 +940,838 @@ TEST_F(futex_op, test_futex_robust_unlock)
  	ASSERT_EQ((uintptr_t)(unsigned long)head.list_op_pending, exp);
  }
  
@@ -213,7 +215,7 @@ index 6a53ce0533be..508541010f61 100644
 +	ASSERT_EQ(errno, EINVAL);
 +
 +	/* Valid flags are accepted and the registered size is reported */
-+	ret = set_list2(&head, ROBUST_LIST_COOKIE);
++	ret = set_list2(&head, ROBUST_LIST_COOKIE | ROBUST_LIST_WAITERS_STRICT);
 +	ASSERT_EQ(ret, 0);
 +
 +	ret = get_robust_list(0, &get_head, &len);
@@ -241,6 +243,7 @@ index 6a53ce0533be..508541010f61 100644
 +	uint32_t		lock_cookie;
 +	uint32_t		entry_cookie;
 +	bool			error_inject;
++	bool			strict;
 +};
 +
 +/*
@@ -255,7 +258,8 @@ index 6a53ce0533be..508541010f61 100644
 +	struct robust_list_head2 head;
 +	int ret;
 +
-+	ret = set_list2(&head, ROBUST_LIST_COOKIE);
++	ret = set_list2(&head, ROBUST_LIST_COOKIE |
++			       (args->strict ? ROBUST_LIST_WAITERS_STRICT : 0));
 +	if (ret) {
 +		ksft_test_result_fail("set_robust_list v2 error\n");
 +		return ret;
@@ -287,7 +291,7 @@ index 6a53ce0533be..508541010f61 100644
 +
 +static void cookie_robustness_test(struct __test_metadata *_metadata,
 +				   uint32_t lock_cookie, uint32_t entry_cookie,
-+				   bool error_inject)
++				   bool error_inject, bool strict)
 +{
 +	struct lock_struct2 lock = { .futex = 0 };
 +	_Atomic(unsigned int) *futex = &lock.futex;
@@ -296,6 +300,7 @@ index 6a53ce0533be..508541010f61 100644
 +		.lock_cookie	= lock_cookie,
 +		.entry_cookie	= entry_cookie,
 +		.error_inject	= error_inject,
++		.strict		= strict,
 +	};
 +	bool match = lock_cookie == entry_cookie;
 +	int ret, pid, wstatus;
@@ -316,15 +321,28 @@ index 6a53ce0533be..508541010f61 100644
 +		 */
 +		ASSERT_EQ(ret, 0);
 +		ASSERT_TRUE(atomic_load(futex) & FUTEX_OWNER_DIED);
-+	} else if (error_inject) {
++	} else if (error_inject && !strict) {
 +		/*
 +		 * A foreign owned lock with the dying child's pending op
-+		 * on it: the kernel must not touch the futex value, and
-+		 * because this waiter armed FUTEX_WAITERS before sleeping
-+		 * the wakeup chain is intact - the consumed-wakeup replay
-+		 * (which fires only for a FUTEX_WAITERS-free value) must
-+		 * stay silent and the wait times out. The bit-free case
-+		 * is covered by test_robust_pending_mismatch_wake.
++		 * on it: the kernel must not touch the futex value, but
++		 * it replays the wakeup the dying child may have consumed
++		 * - unconditionally, even though this waiter armed
++		 * FUTEX_WAITERS before sleeping, because without a
++		 * ROBUST_LIST_WAITERS_STRICT registration the bit carries
++		 * no owner side wakeup promise. This waiter is the
++		 * (spuriously) woken one.
++		 */
++		ASSERT_EQ(ret, 0);
++		ASSERT_FALSE(atomic_load(futex) & FUTEX_OWNER_DIED);
++		ASSERT_EQ(atomic_load(futex) & FUTEX_TID_MASK, lock_cookie);
++	} else if (error_inject) {
++		/*
++		 * Same, but the dying child registered with
++		 * ROBUST_LIST_WAITERS_STRICT: its protocol promises that
++		 * owners only ever clear FUTEX_WAITERS with a waking
++		 * unlock, so the bit this waiter armed proves the wakeup
++		 * chain intact and the replay must stay silent - the wait
++		 * times out.
 +		 */
 +		ASSERT_EQ(ret, -1);
 +		ASSERT_EQ(errno, ETIMEDOUT);
@@ -353,7 +371,7 @@ index 6a53ce0533be..508541010f61 100644
 + */
 +TEST(test_robustness_cookie)
 +{
-+	cookie_robustness_test(_metadata, COOKIE_A, COOKIE_A, false);
++	cookie_robustness_test(_metadata, COOKIE_A, COOKIE_A, false, false);
 +}
 +
 +/*
@@ -362,20 +380,29 @@ index 6a53ce0533be..508541010f61 100644
 + */
 +TEST(test_robustness_cookie_mismatch)
 +{
-+	cookie_robustness_test(_metadata, COOKIE_A, COOKIE_B, false);
++	cookie_robustness_test(_metadata, COOKIE_A, COOKIE_B, false, false);
 +}
 +
 +/*
-+ * list_op_pending handling with matching and mismatched cookies
++ * list_op_pending handling with matching and mismatched cookies. The
++ * mismatch case is run with and without ROBUST_LIST_WAITERS_STRICT in
++ * the dying child's registration: by default the discarded pending op
++ * replays the possibly consumed wakeup even though the waiter armed
++ * FUTEX_WAITERS; with the flag the armed bit suppresses the replay.
 + */
 +TEST(test_list_op_pending_cookie)
 +{
-+	cookie_robustness_test(_metadata, COOKIE_A, COOKIE_A, true);
++	cookie_robustness_test(_metadata, COOKIE_A, COOKIE_A, true, false);
 +}
 +
 +TEST(test_list_op_pending_cookie_mismatch)
 +{
-+	cookie_robustness_test(_metadata, COOKIE_A, COOKIE_B, true);
++	cookie_robustness_test(_metadata, COOKIE_A, COOKIE_B, true, false);
++}
++
++TEST(test_list_op_pending_cookie_mismatch_strict)
++{
++	cookie_robustness_test(_metadata, COOKIE_A, COOKIE_B, true, true);
 +}
 +
 +/*

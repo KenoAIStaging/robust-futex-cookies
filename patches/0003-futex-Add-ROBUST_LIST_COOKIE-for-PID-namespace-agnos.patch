@@ -1,7 +1,7 @@
-From dd988c454ed47a41e31c0df1c8795e06b7e88c02 Mon Sep 17 00:00:00 2001
+From bcb3753116d186c34b0138ee246ae9281a5766ee Mon Sep 17 00:00:00 2001
 From: Keno Fischer <keno@juliahub.com>
 Date: Thu, 16 Jul 2026 08:19:53 +0000
-Subject: [PATCH 3/8] futex: Add ROBUST_LIST_COOKIE for PID namespace agnostic
+Subject: [PATCH 3/9] futex: Add ROBUST_LIST_COOKIE for PID namespace agnostic
  robust lists
 
 The robust list exit time cleanup identifies futexes held by the exiting
@@ -329,7 +329,7 @@ index 10a36c551675..b64f024a0996 100644
   * Are there any waiters for this robust futex:
   */
 diff --git a/kernel/futex/core.c b/kernel/futex/core.c
-index e1a8772e4d48..1f431cc9fee6 100644
+index b21c42cbea18..9a45c1302f98 100644
 --- a/kernel/futex/core.c
 +++ b/kernel/futex/core.c
 @@ -964,13 +964,21 @@ void futex_unqueue_pi(struct futex_q *q)

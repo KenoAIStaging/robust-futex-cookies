@@ -10,3 +10,4 @@ cd /tests || exit 1
 ./robust_lost_wakeup || exit 1
 ./bench_rfmutex 20000 200 4 || exit 1
 ./robust_lost_wakeup_race || exit 1
+./robust_lost_wakeup_glibc || exit 1

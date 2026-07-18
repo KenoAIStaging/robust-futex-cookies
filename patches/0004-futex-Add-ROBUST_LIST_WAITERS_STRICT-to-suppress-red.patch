@@ -1,0 +1,244 @@
+From fc3d7848210e711bae88f353fcaac5f888b7cc8a Mon Sep 17 00:00:00 2001
+From: Keno Fischer <keno@juliahub.com>
+Date: Sat, 18 Jul 2026 01:31:09 +0000
+Subject: [PATCH 4/9] futex: Add ROBUST_LIST_WAITERS_STRICT to suppress
+ redundant robust wakeups
+
+When the exit time robust list walk discards the dying task's pending
+lock operation because the futex has a live owner, it replays the
+wakeup the dying task may have consumed: the task may have been a
+waiter woken by a robust unlock - which wiped FUTEX_WAITERS along with
+the rest of the futex value - and killed before acting on the
+notification, leaving the remaining waiters stranded behind an owner
+which will never see contention.
+
+The replay is unconditional. Within a protocol whose lock owners only
+ever clear FUTEX_WAITERS with an unlock which issues a wakeup, an
+observed bit would already guarantee a future wakeup from the live
+owner - the bit persists even if the task which re-armed it dies
+before sleeping - and the replay would be redundant. But the robust
+futex ABI does not demand that discipline from lock owners; it only
+obliges waiters to arm the bit before sleeping, so the kernel cannot
+infer a wakeup promise from it in general and pays a spurious wakeup
+on every contended exit with an armed pending op instead.
+
+Let protocols which do provide the stricter owner side guarantee (as
+glibc's mutexes do) declare it: a robust_list_head2 registration with
+ROBUST_LIST_WAITERS_STRICT in its flags suppresses the replay whenever
+the futex value carries FUTEX_WAITERS. The flag is independent of
+ROBUST_LIST_COOKIE and describes only the registering task's own
+protocol. The wakeup for a pending operation on an already released
+futex value stays unconditional: a free futex has no owner whose
+future unlock could carry the wakeup chain.
+
+The strictness is latched per registration and handed from the two
+list walkers into handle_futex_death(); classic robust_list_head users
+keep the unconditional replay (there is nowhere to declare the
+guarantee, and assuming it would reintroduce the lost wakeup for
+protocols without it).
+
+Both variants of the pending op handling were model checked with TLC
+at the waiter/wakeup level: NoLostWakeup holds with the replay
+unconditional and with it suppressed under the strict owner
+discipline, and demonstrably breaks if the strict-mode suppression is
+applied to a protocol which does not honor the discipline.
+
+This patch was developed with the assistance of Claude (an AI
+assistant by Anthropic); the author reviewed, validated and takes
+responsibility for the changes.
+
+Signed-off-by: Keno Fischer <keno@juliahub.com>
+---
+ Documentation/locking/robust-futex-ABI.rst | 31 +++++++++++++++++++++
+ include/uapi/linux/futex.h                 | 11 ++++++++
+ kernel/futex/core.c                        | 32 ++++++++++++++++------
+ kernel/futex/futex.h                       |  3 +-
+ 4 files changed, 68 insertions(+), 9 deletions(-)
+
+diff --git a/Documentation/locking/robust-futex-ABI.rst b/Documentation/locking/robust-futex-ABI.rst
+index 36a564c87a4b..c06899c66bc1 100644
+--- a/Documentation/locking/robust-futex-ABI.rst
++++ b/Documentation/locking/robust-futex-ABI.rst
+@@ -312,3 +312,34 @@ file locks on a shared file, or with per lock reservation counters.
+ registration time. Kernel assisted priority inheritance
+ (``FUTEX_LOCK_PI``) is not supported with cookie identifiers, as the
+ kernel cannot resolve a cookie to a task.
++
++Strict FUTEX_WAITERS owner discipline
++=====================================
++
++When the exit time cleanup discards a pending lock operation because
++the lock has a live owner, it wakes one waiter: the dying task may
++itself have been a waiter which consumed the wakeup of a robust unlock
++(which stores 0 over the lock word, wiping ``FUTEX_WAITERS``) and was
++killed before acting on it, and with the bit wiped the new owner would
++unlock through the uncontended fast path and never wake the remaining
++waiters. This replayed wakeup is issued even if the lock word carries
++``FUTEX_WAITERS`` again by the time the cleanup runs: the protocol
++described in this document only obliges *waiters* to arm the bit
++before sleeping, so an observed bit carries no promise that a future
++unlock will wake anybody. A woken waiter re-evaluates the lock word
++and re-arms the bit before sleeping again, so the occasional spurious
++wakeup is harmless.
++
++A protocol whose lock *owners* additionally guarantee that
++``FUTEX_WAITERS`` is only ever cleared by an unlock which issues a
++wakeup (glibc's mutexes provide this) does not need that replay when
++the bit is set - the observed bit already guarantees a future wakeup
++from the live owner, even if the task which re-armed it dies before
++sleeping. Such a protocol can declare the stricter discipline by
++registering the extended list head with ``ROBUST_LIST_WAITERS_STRICT``
++in 'flags'; the exit time cleanup then suppresses the replay whenever
++the lock word carries ``FUTEX_WAITERS``, avoiding the spurious wakeup.
++The flag is independent of ``ROBUST_LIST_COOKIE`` and describes only
++the registering task's own protocol; the wakeup for a pending
++operation on an already released lock word is issued regardless (a
++free lock has no owner whose unlock could carry the wakeup chain).
+diff --git a/include/uapi/linux/futex.h b/include/uapi/linux/futex.h
+index b64f024a0996..c4057c6557e9 100644
+--- a/include/uapi/linux/futex.h
++++ b/include/uapi/linux/futex.h
+@@ -247,6 +247,17 @@ struct robust_list_head2 {
+ 
+ /* Valid bits for robust_list_head2::flags */
+ #define ROBUST_LIST_COOKIE		(0x1UL)
++/*
++ * The registering task's locking protocol honors a strict FUTEX_WAITERS
++ * owner discipline: lock owners only ever clear the bit with an unlock
++ * which issues a wakeup. Under this guarantee an observed FUTEX_WAITERS
++ * implies a future wakeup from the live owner, so the exit time cleanup
++ * suppresses the replay of a possibly consumed wakeup (see
++ * handle_futex_death()) whenever the futex value carries the bit.
++ * Without the flag the replay is unconditional, as the bit proves
++ * nothing about the future behavior of an owner outside the protocol.
++ */
++#define ROBUST_LIST_WAITERS_STRICT	(0x2UL)
+ 
+ /*
+  * Are there any waiters for this robust futex:
+diff --git a/kernel/futex/core.c b/kernel/futex/core.c
+index 9a45c1302f98..769906a0dedb 100644
+--- a/kernel/futex/core.c
++++ b/kernel/futex/core.c
+@@ -973,9 +973,15 @@ void futex_unqueue_pi(struct futex_q *q)
+  * deliberately not masked, so an out of domain identifier never matches
+  * any futex value and the entry is skipped (fail closed) instead of
+  * aliasing a valid owner.
++ *
++ * @strict reflects a ROBUST_LIST_WAITERS_STRICT registration: the
++ * dying task's protocol guarantees that lock owners only ever clear
++ * FUTEX_WAITERS with an unlock which issues a wakeup, which lets the
++ * owner mismatch replay below trust an observed FUTEX_WAITERS.
+  */
+ static int handle_futex_death(u32 __user *uaddr, struct task_struct *curr,
+-			      unsigned int mod, bool pending_op, u32 owner_id)
++			      unsigned int mod, bool pending_op, bool strict,
++			      u32 owner_id)
+ {
+ 	bool pi = !!(mod & FUTEX_ROBUST_MOD_PI);
+ 	u32 uval, nval, mval, owner;
+@@ -1051,8 +1057,16 @@ static int handle_futex_death(u32 __user *uaddr, struct task_struct *curr,
+ 		 * waiter re-evaluates the futex value and re-arms
+ 		 * FUTEX_WAITERS before waiting again, so a spurious wake up
+ 		 * is harmless.
++		 *
++		 * Protocols whose owners do commit to clearing the bit
++		 * only with a waking unlock declare this by registering
++		 * with ROBUST_LIST_WAITERS_STRICT (@strict): there an
++		 * observed FUTEX_WAITERS guarantees a future wake up from
++		 * the live owner (the bit persists even if its setter dies
++		 * before sleeping), no wake up was consumed and the replay
++		 * is suppressed.
+ 		 */
+-		if (pending_op && !pi)
++		if (pending_op && !pi && !(strict && (uval & FUTEX_WAITERS)))
+ 			futex_wake(uaddr, FLAGS_SIZE_32 | FLAGS_SHARED, NULL, 1,
+ 				   FUTEX_BITSET_MATCH_ANY);
+ 		return 0;
+@@ -1163,6 +1177,7 @@ static void exit_robust_list(struct task_struct *curr)
+ 	unsigned int limit = ROBUST_LIST_LIMIT, cur_mod, next_mod, pend_mod;
+ 	struct robust_list __user *entry, *next_entry, *pending;
+ 	bool cookies = curr->futex.robust_list_flags & ROBUST_LIST_COOKIE;
++	bool strict = curr->futex.robust_list_flags & ROBUST_LIST_WAITERS_STRICT;
+ 	struct robust_list __user *pending_next = NULL;
+ 	unsigned int pending_next_mod = 0;
+ 	bool pending_handled = false;
+@@ -1233,7 +1248,7 @@ static void exit_robust_list(struct task_struct *curr)
+ 		if (!(pend_mod & FUTEX_ROBUST_MOD_PI))
+ 			handle_futex_death((void __user *)pending + futex_offset,
+ 					   curr, pend_mod, HANDLE_DEATH_PENDING,
+-					   pending_cookie);
++					   strict, pending_cookie);
+ 		pending_handled = true;
+ 	}
+ 
+@@ -1267,7 +1282,7 @@ static void exit_robust_list(struct task_struct *curr)
+ 				return;
+ 			if (handle_futex_death((void __user *)entry + futex_offset,
+ 						curr, cur_mod, HANDLE_DEATH_LIST,
+-						owner_id))
++						strict, owner_id))
+ 				return;
+ 		}
+ 		if (rc)
+@@ -1286,7 +1301,7 @@ static void exit_robust_list(struct task_struct *curr)
+ 	if (pending && !pending_handled) {
+ 		handle_futex_death((void __user *)pending + futex_offset,
+ 				   curr, pend_mod, HANDLE_DEATH_PENDING,
+-				   pending_cookie);
++				   strict, pending_cookie);
+ 	}
+ }
+ 
+@@ -1366,6 +1381,7 @@ static void compat_exit_robust_list(struct task_struct *curr)
+ 	unsigned int limit = ROBUST_LIST_LIMIT, cur_mod, next_mod, pend_mod;
+ 	struct robust_list __user *entry, *next_entry, *pending;
+ 	bool cookies = curr->futex.compat_robust_list_flags & ROBUST_LIST_COOKIE;
++	bool strict = curr->futex.compat_robust_list_flags & ROBUST_LIST_WAITERS_STRICT;
+ 	compat_uptr_t uentry, next_uentry, upending;
+ 	struct robust_list __user *pending_next = NULL;
+ 	compat_uptr_t pending_next_uentry = 0;
+@@ -1414,7 +1430,7 @@ static void compat_exit_robust_list(struct task_struct *curr)
+ 				&pending_next_mod);
+ 		if (!(pend_mod & FUTEX_ROBUST_MOD_PI))
+ 			handle_futex_death(uaddr, curr, pend_mod,
+-					   HANDLE_DEATH_PENDING,
++					   HANDLE_DEATH_PENDING, strict,
+ 					   pending_cookie);
+ 		pending_handled = true;
+ 	}
+@@ -1449,7 +1465,7 @@ static void compat_exit_robust_list(struct task_struct *curr)
+ 							 &owner_id))
+ 				return;
+ 			if (handle_futex_death(uaddr, curr, cur_mod, HANDLE_DEATH_LIST,
+-					       owner_id))
++					       strict, owner_id))
+ 				return;
+ 		}
+ 		if (rc)
+@@ -1469,7 +1485,7 @@ static void compat_exit_robust_list(struct task_struct *curr)
+ 		void __user *uaddr = futex_uaddr(pending, futex_offset);
+ 
+ 		handle_futex_death(uaddr, curr, pend_mod, HANDLE_DEATH_PENDING,
+-				   pending_cookie);
++				   strict, pending_cookie);
+ 	}
+ }
+ 
+diff --git a/kernel/futex/futex.h b/kernel/futex/futex.h
+index 77d7a09fe5b9..9c5cbc10b8ca 100644
+--- a/kernel/futex/futex.h
++++ b/kernel/futex/futex.h
+@@ -50,7 +50,8 @@
+  * overlap with the UAPI ROBUST_LIST_* flag space.
+  */
+ #define FUTEX_RLIST_V2			(1U << 31)
+-#define FUTEX_RLIST_VALID_FLAGS		(ROBUST_LIST_COOKIE)
++#define FUTEX_RLIST_VALID_FLAGS		(ROBUST_LIST_COOKIE | \
++					 ROBUST_LIST_WAITERS_STRICT)
+ 
+ /* FUTEX_ to FLAGS_ */
+ static inline unsigned int futex_to_flags(unsigned int op)
+-- 
+2.54.0
+

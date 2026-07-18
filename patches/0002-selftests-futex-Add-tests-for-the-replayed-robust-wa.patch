@@ -1,15 +1,14 @@
-From f5e2e50f0e49b7d082c133ca6a756d646eb8dd3e Mon Sep 17 00:00:00 2001
+From 8e6c0ad3cf93ebff4af95ed24aa5f044506ebcba Mon Sep 17 00:00:00 2001
 From: Keno Fischer <keno@juliahub.com>
-Date: Fri, 17 Jul 2026 22:39:06 +0000
-Subject: [PATCH 2/8] selftests/futex: Add tests for the replayed robust wakeup
+Date: Sat, 18 Jul 2026 01:28:41 +0000
+Subject: [PATCH 2/9] selftests/futex: Add tests for the replayed robust wakeup
 
 Test that the exit time robust list walk wakes a waiter when it
 discards the dying task's pending lock operation because the futex is
-owned by a different, live task and the futex value does not carry
-FUTEX_WAITERS - the dying task may have been a woken waiter which was
-killed before it could act on its wakeup, and that wakeup would
-otherwise be lost (the robust unlock which issued it also wiped
-FUTEX_WAITERS, so the futex's new owner will unlock through the
+owned by a different, live task - the dying task may have been a woken
+waiter which was killed before it could act on its wakeup, and that
+wakeup would otherwise be lost (the robust unlock which issued it also
+wiped FUTEX_WAITERS, so the futex's new owner will unlock through the
 uncontended fast path).
 
 The test constructs the post-race state deterministically instead of
@@ -21,11 +20,11 @@ the futex (flag handshake plus /proc state poll), so the test is not
 timing sensitive. On a kernel without the fix the parent's futex_wait
 times out; with the fix it is woken and the futex value is untouched.
 
-A second test pins down the negative half of the semantics: with
-FUTEX_WAITERS set in the futex value, the walk must not wake anybody -
-the bit guarantees a wakeup from the live owner's unlock, so there is
-no consumed wakeup to compensate and a replay would only cause
-spurious wakeups on every contended exit.
+A second test pins down that the replay is unconditional: it fires
+even when the futex value carries FUTEX_WAITERS again by the time the
+walk runs, because the ABI places no obligation on lock owners to
+clear the bit only via a waking unlock, so the bit does not prove a
+future wakeup.
 
 This patch was developed with the assistance of Claude (an AI
 assistant by Anthropic); the author reviewed, validated and takes
@@ -33,14 +32,14 @@ responsibility for the changes.
 
 Signed-off-by: Keno Fischer <keno@juliahub.com>
 ---
- .../selftests/futex/functional/robust_list.c  | 144 ++++++++++++++++++
- 1 file changed, 144 insertions(+)
+ .../selftests/futex/functional/robust_list.c  | 143 ++++++++++++++++++
+ 1 file changed, 143 insertions(+)
 
 diff --git a/tools/testing/selftests/futex/functional/robust_list.c b/tools/testing/selftests/futex/functional/robust_list.c
-index b3fab60181d5..6a53ce0533be 100644
+index b3fab60181d5..75d1858c511b 100644
 --- a/tools/testing/selftests/futex/functional/robust_list.c
 +++ b/tools/testing/selftests/futex/functional/robust_list.c
-@@ -480,6 +480,150 @@ static int child_wait_lock(void *arg)
+@@ -480,6 +480,149 @@ static int child_wait_lock(void *arg)
  	return 0;
  }
  
@@ -146,15 +145,15 @@ index b3fab60181d5..6a53ce0533be 100644
 +}
 +
 +/*
-+ * The negative half of the replay semantics: with FUTEX_WAITERS set in
-+ * the futex value, the walk must not wake anybody. The bit is only
-+ * ever cleared by an unlock which issues a wakeup, so it guarantees a
-+ * future wakeup from the live owner's unlock - no wakeup was consumed
-+ * and a replay would only cause spurious wakeups on every contended
-+ * exit. The waiting parent must time out and the futex value must be
-+ * untouched.
++ * The replay is unconditional: it fires even with FUTEX_WAITERS set in
++ * the futex value. Within a protocol whose owners only ever clear the
++ * bit with a waking unlock the bit would guarantee a future wakeup,
++ * but the ABI does not require that of lock owners - only the waiter
++ * side obligation to arm the bit exists - so the kernel must not read
++ * a wakeup promise into it. The waiting parent must be woken and the
++ * futex value must be untouched.
 + */
-+TEST(test_robust_pending_mismatch_waiters_no_wake)
++TEST(test_robust_pending_mismatch_waiters_wake)
 +{
 +	struct lock_struct lock = { .futex = 0 };
 +	_Atomic(unsigned int) *futex = &lock.futex;
@@ -174,9 +173,8 @@ index b3fab60181d5..6a53ce0533be 100644
 +	atomic_store(&parent_waiting, 1);
 +	ret = futex_wait((futex_t *)futex, tid | FUTEX_WAITERS, &to, 0);
 +
-+	/* No replay with FUTEX_WAITERS armed: the wait must time out */
-+	ASSERT_EQ(ret, -1);
-+	ASSERT_EQ(errno, ETIMEDOUT);
++	/* Woken by the exit walk's replayed wakeup, not timed out */
++	ASSERT_EQ(ret, 0);
 +
 +	/* The futex has a live owner: the walk must not touch its value */
 +	ASSERT_EQ(atomic_load(futex), (unsigned int)(tid | FUTEX_WAITERS));

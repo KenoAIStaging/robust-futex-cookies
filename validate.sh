@@ -84,6 +84,9 @@ step "lost wakeup reproducer" "$CC" -O2 -Wall -Wextra \
     -o "$HERE/repro/robust_lost_wakeup" "$HERE/repro/robust_lost_wakeup.c"
 step "lost wakeup race reproducer" "$CC" -O2 -Wall -Wextra \
     -o "$HERE/repro/robust_lost_wakeup_race" "$HERE/repro/robust_lost_wakeup_race.c"
+step "lost wakeup glibc reproducer" "$CC" -O2 -Wall -Wextra \
+    -o "$HERE/repro/robust_lost_wakeup_glibc" "$HERE/repro/robust_lost_wakeup_glibc.c" \
+    -lpthread
 
 # --- 3. QEMU test run ----------------------------------------------------
 step "initramfs" "$HERE/harness/mkinitramfs.sh" "$HERE/initramfs/run-all.sh" \
@@ -92,7 +95,8 @@ step "initramfs" "$HERE/harness/mkinitramfs.sh" "$HERE/initramfs/run-all.sh" \
     "$HERE/lib/test_rfmutex" \
     "$HERE/lib/bench_rfmutex" \
     "$HERE/repro/robust_lost_wakeup" \
-    "$HERE/repro/robust_lost_wakeup_race"
+    "$HERE/repro/robust_lost_wakeup_race" \
+    "$HERE/repro/robust_lost_wakeup_glibc"
 note "initramfs sha256: $(sha256sum "$HERE/initramfs/initramfs.cpio.gz" | cut -d' ' -f1)"
 step "QEMU guest tests" "$HERE/harness/runqemu.sh" -c "$(nproc)" -t 900
 
@@ -110,6 +114,7 @@ step "QEMU guest tests" "$HERE/harness/runqemu.sh" -c "$(nproc)" -t 900
 # violation-expected configs stop at their counterexample anyway).
 MODELS_QUICK="
 MCExplicitOK:pass:nodl
+MCExplicitOKStrict:pass:nodl
 MCExplicitNoWake:violation:nodl
 MCExplicitLostWaiter:violation:nodl
 MCExplicitLeaseABA:violation:dl

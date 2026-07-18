@@ -1,7 +1,7 @@
-From 449a4829bceb1ac81d13b552a70e71f0f33163dc Mon Sep 17 00:00:00 2001
+From b8a2e72208874e3c673995b9f671188a15627d26 Mon Sep 17 00:00:00 2001
 From: Keno Fischer <keno@juliahub.com>
 Date: Thu, 16 Jul 2026 08:22:29 +0000
-Subject: [PATCH 5/8] futex/vdso: Implement
+Subject: [PATCH 6/9] futex/vdso: Implement
  __vdso_futex_robust_list{64,32}_cmpxchg_rseq()
 
 Cookie based robust futexes (ROBUST_LIST_COOKIE) require user space to
@@ -143,7 +143,7 @@ Signed-off-by: Keno Fischer <keno@juliahub.com>
  14 files changed, 434 insertions(+), 7 deletions(-)
 
 diff --git a/Documentation/locking/robust-futex-ABI.rst b/Documentation/locking/robust-futex-ABI.rst
-index 36a564c87a4b..d044dcd3aec7 100644
+index c06899c66bc1..46aa9012f14a 100644
 --- a/Documentation/locking/robust-futex-ABI.rst
 +++ b/Documentation/locking/robust-futex-ABI.rst
 @@ -306,7 +306,10 @@ skipped, as are entries carrying the PI modifier bit. The 'flags' and
@@ -665,10 +665,10 @@ index 3cd175eefe64..249393857134 100644
 +
  #endif
 diff --git a/kernel/futex/core.c b/kernel/futex/core.c
-index 1f431cc9fee6..a10307cbe470 100644
+index 769906a0dedb..02a5f2f95147 100644
 --- a/kernel/futex/core.c
 +++ b/kernel/futex/core.c
-@@ -1609,11 +1609,116 @@ void __futex_fixup_robust_unlock(struct pt_regs *regs, struct futex_unlock_cs_ra
+@@ -1625,11 +1625,116 @@ void __futex_fixup_robust_unlock(struct pt_regs *regs, struct futex_unlock_cs_ra
  	futex_robust_list_clear_pending(pop, csr->pop_size32 ? FLAGS_ROBUST_LIST32 : 0);
  }
  
@@ -786,7 +786,7 @@ index 1f431cc9fee6..a10307cbe470 100644
  		exit_robust_list(tsk);
  		tsk->futex.robust_list = NULL;
  		tsk->futex.robust_list_flags = 0;
-@@ -1621,6 +1726,7 @@ static void futex_cleanup(struct task_struct *tsk)
+@@ -1637,6 +1742,7 @@ static void futex_cleanup(struct task_struct *tsk)
  
  #ifdef CONFIG_COMPAT
  	if (unlikely(tsk->futex.compat_robust_list)) {
@@ -794,7 +794,7 @@ index 1f431cc9fee6..a10307cbe470 100644
  		compat_exit_robust_list(tsk);
  		tsk->futex.compat_robust_list = NULL;
  		tsk->futex.compat_robust_list_flags = 0;
-@@ -2147,13 +2253,15 @@ static void futex_invalidate_cs_ranges(struct futex_mm_data *fd)
+@@ -2163,13 +2269,15 @@ static void futex_invalidate_cs_ranges(struct futex_mm_data *fd)
  	 * tasks as they use VDSO32 which does not provide the 64-bit pointer
  	 * variant.
  	 */

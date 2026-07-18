@@ -5,7 +5,7 @@ benchmarks and TLA+ verification for making **robust futexes work across
 PID namespaces** by replacing the TID in the lock word with a user space
 managed **owner cookie**.
 
-The kernel series (8 patches, `patches/`) applies on top of mainline
+The kernel series (9 patches, `patches/`) applies on top of mainline
 after the 7.2 `FUTEX_ROBUST_UNLOCK`/vDSO robust-unlock work and adds:
 
 0. A standalone fix (patches 1-2, independently applicable): the exit
@@ -13,10 +13,15 @@ after the 7.2 `FUTEX_ROBUST_UNLOCK`/vDSO robust-unlock work and adds:
    have consumed. A robust unlock wipes `FUTEX_WAITERS` and wakes one
    waiter; if that waiter is killed before acting on the wakeup while
    a third task re-acquired the futex, the remaining waiters slept
-   forever on current kernels (deterministic and racing reproducers
-   in `repro/`). The replay fires only while `FUTEX_WAITERS` is not
-   re-armed - an observed bit is only ever cleared by an unlock which
-   wakes, so it already guarantees a wakeup from the live owner.
+   forever on current kernels (deterministic, racing and stock-glibc
+   reproducers in `repro/`). The replay is unconditional (a spurious
+   wake is harmless by the futex contract): the non-PI futex ABI
+   assigns `FUTEX_WAITERS` obligations only to waiters, so an
+   observed bit proves nothing about future wakes. Protocols whose
+   *owners* also honor the bit ("only cleared by an unlock which
+   wakes", as glibc and rfmutex do) can suppress the then-redundant
+   replay by registering with `ROBUST_LIST_WAITERS_STRICT` (patch 4,
+   `robust_list_head2` only).
 1. `ROBUST_LIST_COOKIE` — an extensible robust list head
    (`struct robust_list_head2`, selected by size) which makes the exit
    time cleanup compare the futex word against per-entry cookies and a
@@ -119,12 +124,13 @@ cookies for POSIX mutexes without global coordination, is the new part.
 
 ## Verification
 
-- Kernel selftests: 38 futex tests (including a live PID namespace
+- Kernel selftests: 40 futex tests (including a live PID namespace
   corruption reproducer and its cookie-based fix, exit-walk ordering
   tests which demonstrably fail on a kernel without the
-  pending-before-entries cleanup order, and the classic-protocol
-  lost wakeup test of patch 2, which demonstrably fails on an
-  unfixed kernel) and 4 membarrier tests, run under QEMU.
+  pending-before-entries cleanup order, the classic-protocol
+  lost wakeup tests of patch 2, which demonstrably fail on an
+  unfixed kernel, and the ROBUST_LIST_WAITERS_STRICT replay
+  suppression) and 4 membarrier tests, run under QEMU.
 - `repro/robust_lost_wakeup.c`: a standalone deterministic reproducer
   for the lost wakeup fixed by patch 1 - the waiter times out (would
   hang forever) on unfixed kernels, verified against the unfixed 6.8
@@ -135,6 +141,12 @@ cookies for POSIX mutexes without global coordination, is the new part.
   on a free futex within a handful of kill rounds on the unfixed 6.8
   host, and cannot strand one on the patched kernel (run as a
   negative control in the QEMU guest suite).
+- `repro/robust_lost_wakeup_glibc.c`: the same race using nothing but
+  stock `pthread_mutex_t` (`PTHREAD_MUTEX_ROBUST` +
+  `PTHREAD_PROCESS_SHARED`) - a surviving process sleeps forever
+  inside `pthread_mutex_lock()` on a mutex `pthread_mutex_trylock()`
+  proves free. Reproduces within a handful of rounds on the unfixed
+  6.8 host; negative control in the QEMU guest suite.
 - `rfmutex` (in `lib/`): mutual exclusion, cross PID namespace and
   SIGKILL stress tests with EOWNERDEAD recovery for all three cookie
   assignment schemes, plus lifecycle tests (concurrent first attach,

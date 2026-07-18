@@ -7,3 +7,4 @@ lib/test_rfmutex
 lib/bench_rfmutex
 repro/robust_lost_wakeup
 repro/robust_lost_wakeup_race
+repro/robust_lost_wakeup_glibc
