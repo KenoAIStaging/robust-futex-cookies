@@ -114,7 +114,6 @@ step "QEMU guest tests" "$HERE/harness/runqemu.sh" -c "$(nproc)" -t 900
 # violation-expected configs stop at their counterexample anyway).
 MODELS_QUICK="
 MCExplicitOK:pass:nodl
-MCExplicitOKStrict:pass:nodl
 MCExplicitNoWake:violation:nodl
 MCExplicitLostWaiter:violation:nodl
 MCExplicitLeaseABA:violation:dl

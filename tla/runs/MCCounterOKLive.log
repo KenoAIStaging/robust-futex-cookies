@@ -1,0 +1,46 @@
+TLC2 Version 2026.07.15.134331 (rev: 227f61b)
+Running breadth-first search Model-Checking with fp 88 and seed -531130482912387930 with 128 workers on 128 cores with 27305MB heap and 64MB offheap memory [pid: 257709] (Linux 6.8.0-134-generic amd64, Debian 11.0.24 64bit, MSBDiskFPSet, DiskStateQueue).
+Parsing file /workspace/robust-futex-work/tla/MCCounterOKLive.tla
+Parsing file /workspace/robust-futex-work/tla/CounterMutex.tla
+Parsing file /tmp/tlc-17079739793262035995/_TLCTrace.tla (jar:file:/workspace/robust-futex-work/tla/tla2tools.jar!/tla2sany/StandardModules/_TLCTrace.tla)
+Parsing file /tmp/tlc-17079739793262035995/Naturals.tla (jar:file:/workspace/robust-futex-work/tla/tla2tools.jar!/tla2sany/StandardModules/Naturals.tla)
+Parsing file /tmp/tlc-17079739793262035995/FiniteSets.tla (jar:file:/workspace/robust-futex-work/tla/tla2tools.jar!/tla2sany/StandardModules/FiniteSets.tla)
+Parsing file /tmp/tlc-17079739793262035995/Sequences.tla (jar:file:/workspace/robust-futex-work/tla/tla2tools.jar!/tla2sany/StandardModules/Sequences.tla)
+Parsing file /tmp/tlc-17079739793262035995/TLC.tla (jar:file:/workspace/robust-futex-work/tla/tla2tools.jar!/tla2sany/StandardModules/TLC.tla)
+Parsing file /tmp/tlc-17079739793262035995/TLCExt.tla (jar:file:/workspace/robust-futex-work/tla/tla2tools.jar!/tla2sany/StandardModules/TLCExt.tla)
+Parsing file /tmp/tlc-17079739793262035995/Integers.tla (jar:file:/workspace/robust-futex-work/tla/tla2tools.jar!/tla2sany/StandardModules/Integers.tla)
+Semantic processing of module Naturals
+Semantic processing of module Sequences
+Semantic processing of module FiniteSets
+Semantic processing of module CounterMutex
+Semantic processing of module TLC
+Semantic processing of module Integers
+Semantic processing of module TLCExt
+Semantic processing of module _TLCTrace
+Semantic processing of module MCCounterOKLive
+Linting of module CounterMutex
+Linting of module TLCExt
+Linting of module _TLCTrace
+Linting of module MCCounterOKLive
+Starting... (2026-07-18 03:48:45)
+Implied-temporal checking--satisfiability problem has 2 branches.
+Computing initial states...
+Finished computing initial states: 1 distinct state generated at 2026-07-18 03:48:45.
+Checking 2 branches of temporal properties for the current state space with 156306 total distinct states at (2026-07-18 03:48:48)
+Finished checking temporal properties in 00s at 2026-07-18 03:48:49
+Progress(26) at 2026-07-18 03:48:49: 193,882 states generated (193,882 s/min), 78,153 distinct states found (78,153 ds/min), 14,972 states left on queue.
+Checking 2 branches of temporal properties for the current state space with 7506342 total distinct states at (2026-07-18 03:49:49)
+Finished checking temporal properties in 33s at 2026-07-18 03:50:22
+Progress(54) at 2026-07-18 03:50:22: 10,057,098 states generated (9,863,216 s/min), 3,753,171 distinct states found (3,675,018 ds/min), 326,804 states left on queue.
+Progress(70) at 2026-07-18 03:51:18: 18,952,797 states generated, 6,641,541 distinct states found, 0 states left on queue.
+Checking 2 branches of temporal properties for the complete state space with 13283082 total distinct states at (2026-07-18 03:51:18)
+Finished checking temporal properties in 58s at 2026-07-18 03:52:16
+Model checking completed. No error has been found.
+  Estimates of the probability that TLC did not check all reachable states
+  because two distinct states had the same fingerprint:
+  calculated (optimistic):  val = 4.4E-6
+  based on the actual fingerprints:  val = 2.1E-7
+18952797 states generated, 6641541 distinct states found, 0 states left on queue.
+The depth of the complete state graph search is 70.
+The average outdegree of the complete state graph is 1 (minimum is 0, the maximum 6 and the 95th percentile is 3).
+Finished in 03min 32s at (2026-07-18 03:52:17)

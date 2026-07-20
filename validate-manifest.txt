@@ -1,0 +1,51 @@
+== validate.sh manifest ==
+date: 2026-07-18T02:15:32Z
+profile: quick
+repo: 438b77dddbe672d61328b4058c909be4db6532ed
+kernel tree: 681722d29eb24b0a95597ce3d81d758542be13ed
+cc: gcc (Debian 10.2.1-6) 10.2.1 20210110
+java: openjdk version "11.0.24" 2024-07-16
+tla2tools.jar sha256: 58d44845a37a8d776deaf8cf3a623213b59d311bc0ec287bcdfbe148dd11bb3d
+qemu: QEMU emulator version 5.2.0 (Debian 1:5.2+dfsg-11+deb11u3)
+PASS: kernel build
+bzImage sha256: 92630f4dd74f602f14015da77acb30b9ee1809a7c4e1999671696d7e69fb261a
+PASS: futex selftests
+PASS: membarrier selftests
+PASS: rfmutex library + bench
+PASS: lost wakeup reproducer
+PASS: lost wakeup race reproducer
+PASS: lost wakeup glibc reproducer
+PASS: initramfs
+initramfs sha256: d7a6ab2267c3a28289cd9ee6d93e3e0ea21fdedb236415e23cb0522c75fd3034
+PASS: QEMU guest tests
+model MCExplicitOK: pass (expected pass; 115192261 states generated)
+PASS: model MCExplicitOK
+model MCExplicitOKStrict: pass (expected pass; 114916303 states generated)
+PASS: model MCExplicitOKStrict
+model MCExplicitNoWake: violation (expected violation; 162634 states generated)
+PASS: model MCExplicitNoWake
+model MCExplicitLostWaiter: violation (expected violation; 14302153 states generated)
+PASS: model MCExplicitLostWaiter
+model MCExplicitLeaseABA: violation (expected violation; 6701 states generated)
+PASS: model MCExplicitLeaseABA
+model MCExplicitLeaseOrder: violation (expected violation; 308991 states generated)
+PASS: model MCExplicitLeaseOrder
+model MCExplicitOldABI: violation (expected violation; 3240 states generated)
+PASS: model MCExplicitOldABI
+model MCExplicitTid: violation (expected violation; 14573 states generated)
+PASS: model MCExplicitTid
+model MCCounterOKLive: pass (expected pass; 18952797 states generated)
+PASS: model MCCounterOKLive
+model MCCounterNoFence: pass (expected pass; 26670697 states generated)
+PASS: model MCCounterNoFence
+model MCCounterNoGate: pass (expected pass; 15828345 states generated)
+PASS: model MCCounterNoGate
+model MCCounterBit1: pass (expected pass; 22499465 states generated)
+PASS: model MCCounterBit1
+model MCCounterNoExitFixup: violation (expected violation; 1352219 states generated)
+PASS: model MCCounterNoExitFixup
+model MCCounterOrigDesign: violation (expected violation; 55966 states generated)
+PASS: model MCCounterOrigDesign
+model MCCounterOldABI: violation (expected violation; 193851 states generated)
+PASS: model MCCounterOldABI
+== VALIDATION PASSED ==

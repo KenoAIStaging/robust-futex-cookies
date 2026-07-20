@@ -1,7 +1,7 @@
-From e4d7c0b779e01e996c81919ce64ea04d3cc832bf Mon Sep 17 00:00:00 2001
+From 99203436787613317de9a7be2798f7b11bb2bf6f Mon Sep 17 00:00:00 2001
 From: Keno Fischer <keno@juliahub.com>
 Date: Thu, 16 Jul 2026 08:22:51 +0000
-Subject: [PATCH 7/9] selftests/futex: Add tests for the VDSO robust cmpxchg
+Subject: [PATCH 6/8] selftests/futex: Add tests for the VDSO robust cmpxchg
  RSEQ operations
 
 Exercise __vdso_futex_robust_list{64,32}_cmpxchg_rseq():
@@ -45,7 +45,7 @@ Signed-off-by: Keno Fischer <keno@juliahub.com>
  1 file changed, 521 insertions(+)
 
 diff --git a/tools/testing/selftests/futex/functional/robust_list.c b/tools/testing/selftests/futex/functional/robust_list.c
-index 5b9300480702..8c7d04dcad79 100644
+index 508541010f61..ba19e92f1a94 100644
 --- a/tools/testing/selftests/futex/functional/robust_list.c
 +++ b/tools/testing/selftests/futex/functional/robust_list.c
 @@ -30,6 +30,7 @@
@@ -64,7 +64,7 @@ index 5b9300480702..8c7d04dcad79 100644
  #include <sys/wait.h>
  
  #define STACK_SIZE (1024 * 1024)
-@@ -1774,4 +1776,523 @@ TEST(test_pending_fault)
+@@ -1750,4 +1752,523 @@ TEST(test_pending_fault)
  	ksft_test_result_pass("%s\n", __func__);
  }
  

@@ -1,7 +1,7 @@
-From 681722d29eb24b0a95597ce3d81d758542be13ed Mon Sep 17 00:00:00 2001
+From 3511bedcf0ceafc89244389539e5083a62063e33 Mon Sep 17 00:00:00 2001
 From: Keno Fischer <keno@juliahub.com>
-Date: Sat, 18 Jul 2026 01:39:41 +0000
-Subject: [PATCH 0/9] futex: PID namespace agnostic robust futexes via owner cookies
+Date: Mon, 20 Jul 2026 22:41:55 +0000
+Subject: [PATCH 0/8] futex: PID namespace agnostic robust futexes via owner cookies
 
 Robust futexes identify the lock owner by storing the owner's TID in the
 futex word and comparing it against the exiting task's TID during the
@@ -23,13 +23,13 @@ the futex was re-acquired through the uncontended fast path in the
 meantime, the dying waiter's exit walk discards its pending op (owner
 mismatch) without waking anybody, and the remaining waiters sleep
 forever behind an owner which will never see contention. The fix
-replays the possibly consumed wakeup unconditionally: the ABI only
-obliges waiters to arm FUTEX_WAITERS before sleeping, so an observed
-bit carries no owner side wakeup promise the kernel could rely on,
-and a spurious wakeup is harmless (patch 4 adds an opt-in for
-protocols which do provide the owner side guarantee). Deterministic
-selftests pin down the semantics, and deterministic, racing and stock
-glibc (pthread_mutex_t with PTHREAD_MUTEX_ROBUST and
+replays the possibly consumed wakeup when the futex value carries no
+FUTEX_WAITERS (an armed bit is only ever cleared by an unlock which
+wakes, so it already guarantees a wakeup from the live owner - a
+meaning the exit walk itself gives the bit by preserving it in the
+OWNER_DIED marking and keying its own wakeup on it). Deterministic
+selftests pin down both halves of the semantics, and deterministic,
+racing and stock glibc (pthread_mutex_t with PTHREAD_MUTEX_ROBUST and
 PTHREAD_PROCESS_SHARED, nothing else) reproducers demonstrate the
 hang on current kernels - the racing ones strand a waiter within a
 handful of kill rounds on a stock 6.8 host. The window was found by model
@@ -52,25 +52,16 @@ via allocation tables in the shared memory itself (ordered after all
 held locks in the list) or via OFD file locks, both of which release
 the identifier no earlier than the holder's exit cleanup.
 
-Patch 4 adds ROBUST_LIST_WAITERS_STRICT, a second flag for the
-extensible list head (independent of ROBUST_LIST_COOKIE): a protocol
-whose lock owners guarantee that FUTEX_WAITERS is only ever cleared
-by an unlock which issues a wakeup - glibc's mutexes qualify - can
-declare that discipline, and the exit walk then suppresses the
-consumed-wakeup replay of patch 1 whenever the futex value carries
-the bit, since the bit already guarantees a wakeup from the live
-owner. Classic robust_list_head users keep the unconditional replay.
-
 For POSIX style process shared mutexes, which have no natural home for
 an allocation protocol, a per lock reservation counter can provide the
 cookies: every lock attempt draws a fresh 30-bit value. Finite counters
 wrap, so the protocol must guarantee that a stale reservation (drawn a
 full counter period ago) can never be published into the lock word, and
 that a dead task's robust list state is never interpreted against a
-lock whose (wrapped) cookie happens to match numerically. Patches 6-8
+lock whose (wrapped) cookie happens to match numerically. Patches 5-7
 provide the required kernel assists:
 
-Patch 6 adds __vdso_futex_robust_list{64,32}_cmpxchg_rseq(): the lock
+Patch 5 adds __vdso_futex_robust_list{64,32}_cmpxchg_rseq(): the lock
 side counterpart of __vdso_futex_robust_list{64,32}_try_unlock(). It
 validates that TLS::rseq::rseq_cs is still armed (the caller arms it
 before drawing the reservation, so any RSEQ event in between
@@ -83,7 +74,7 @@ op that a fatal-signal death left behind in a state where processing it
 would be invalid (uncommitted lock attempt, completed unlock). Both
 exit time fixup windows were found by model checking, see below.
 
-Patch 8 adds MEMBARRIER_CMD_SHARED_EXPEDITED_RSEQ, an RSEQ fence
+Patch 7 adds MEMBARRIER_CMD_SHARED_EXPEDITED_RSEQ, an RSEQ fence
 covering every process which has a shared writable mapping of the page
 containing a given address and has registered with the accompanying
 registration command. This is the quiescence operation executed on
@@ -93,7 +84,7 @@ address is passed via a new fourth syscall argument, following the
 precedent of the cpu_id argument added in 2a36ab717e8f
 ("rseq/membarrier: Add MEMBARRIER_CMD_PRIVATE_EXPEDITED_RSEQ").
 
-Patches 2, 5, 7 and 9 add selftests, including a reproducer of the
+Patches 2, 4, 6 and 8 add selftests, including a reproducer of the
 original cross-namespace corruption (two processes in different PID
 namespaces observing the same namespace local TID) which demonstrates
 that the cookie variant leaves the foreign-owned lock alone.
@@ -108,13 +99,11 @@ collision corruption, the corruption resulting from attributing the
 pending op through the shared entry cookie (which is why
 list_op_pending_cookie exists), the robustness loss of that variant
 even with exit fixups in place, the two exit time fixup windows of
-patch 6 - one of which (death between a committed vdso unlock and the
+patch 5 - one of which (death between a committed vdso unlock and the
 pending op disarm, processed after the lock was re-acquired under a
 wrapped cookie) was a genuine model checker counterexample against a
 design believed correct at the time - and the lost wakeup window fixed
-by patch 1, which turned out not to be cookie specific at all (both
-the unconditional replay and its ROBUST_LIST_WAITERS_STRICT
-suppression pass the no-lost-wakeup liveness exhaustively).
+by patch 1, which turned out not to be cookie specific at all.
 Reference user space implementations of all three cookie assignment
 schemes, benchmarks against pthread mutexes and the TLA+ specifications
 are available and can be posted alongside if desired.
@@ -129,13 +118,11 @@ label colon inside a stringified macro, matching the existing LABEL()
 macro in vfutex.c, and _Atomic()/function pointer declarations in the
 selftests, matching the existing code in robust_list.c).
 
-Keno Fischer (9):
+Keno Fischer (8):
   futex: Replay the wakeup consumed by a robust waiter killed before
     acquiring
   selftests/futex: Add tests for the replayed robust wakeup
   futex: Add ROBUST_LIST_COOKIE for PID namespace agnostic robust lists
-  futex: Add ROBUST_LIST_WAITERS_STRICT to suppress redundant robust
-    wakeups
   selftests/futex: Add robust list cookie tests
   futex/vdso: Implement __vdso_futex_robust_list{64,32}_cmpxchg_rseq()
   selftests/futex: Add tests for the VDSO robust cmpxchg RSEQ operations
@@ -145,7 +132,7 @@ Keno Fischer (9):
 
  Documentation/litmus-tests/README             |   11 +
  .../membarrier-shared-rseq-ready.litmus       |   49 +
- Documentation/locking/robust-futex-ABI.rst    |  120 ++
+ Documentation/locking/robust-futex-ABI.rst    |   89 +
  arch/x86/entry/vdso/common/vfutex.c           |  126 ++
  arch/x86/entry/vdso/vdso32/vdso32.lds.S       |    1 +
  arch/x86/entry/vdso/vdso64/vdso64.lds.S       |    2 +
@@ -160,18 +147,18 @@ Keno Fischer (9):
  include/linux/rseq_entry.h                    |   32 +-
  include/linux/sched/mm.h                      |    2 +
  include/linux/syscalls.h                      |    3 +-
- include/uapi/linux/futex.h                    |   80 +
+ include/uapi/linux/futex.h                    |   69 +
  include/uapi/linux/membarrier.h               |   34 +
  include/vdso/futex.h                          |   91 +
- kernel/futex/core.c                           |  362 +++-
- kernel/futex/futex.h                          |   10 +
+ kernel/futex/core.c                           |  346 +++-
+ kernel/futex/futex.h                          |    9 +
  kernel/futex/syscalls.c                       |  129 +-
  kernel/sched/membarrier.c                     |  269 ++-
- .../selftests/futex/functional/robust_list.c  | 1513 ++++++++++++++++-
+ .../selftests/futex/functional/robust_list.c  | 1489 ++++++++++++++++-
  tools/testing/selftests/membarrier/.gitignore |    1 +
  tools/testing/selftests/membarrier/Makefile   |    6 +
  .../membarrier/membarrier_shared_rseq_test.c  |  432 +++++
- 28 files changed, 3307 insertions(+), 50 deletions(-)
+ 28 files changed, 3224 insertions(+), 50 deletions(-)
  create mode 100644 Documentation/litmus-tests/membarrier/membarrier-shared-rseq-ready.litmus
  create mode 100644 tools/testing/selftests/membarrier/membarrier_shared_rseq_test.c
 

@@ -1,7 +1,7 @@
-From 98b9946cc21a3b4145c5b1802b9569a1ca027e2d Mon Sep 17 00:00:00 2001
+From 11149366a2ed5e669477f1aa2da46818af178b7b Mon Sep 17 00:00:00 2001
 From: Keno Fischer <keno@juliahub.com>
-Date: Sat, 18 Jul 2026 01:28:11 +0000
-Subject: [PATCH 1/9] futex: Replay the wakeup consumed by a robust waiter
+Date: Fri, 17 Jul 2026 22:38:42 +0000
+Subject: [PATCH 1/8] futex: Replay the wakeup consumed by a robust waiter
  killed before acquiring
 
 A robust futex unlock stores 0 over the whole futex value - wiping
@@ -38,21 +38,23 @@ runs. If the futex was re-acquired first, the owner mismatch check
 discards the pending op, and the consumed wakeup with it. Complete the
 handling for the owner mismatch case: when a pending non PI lock
 operation of the dying task is discarded because the futex is owned by
-someone else, wake one waiter. The futex value is not touched - the
-owner is alive - and a spurious wakeup is harmless: woken waiters
-re-evaluate the futex value and re-arm FUTEX_WAITERS before sleeping
-again, which also repairs the wiped bit for the remaining sleepers.
+someone else and the futex value does not carry FUTEX_WAITERS, wake
+one waiter. The futex value is not touched - the owner is alive - and
+a spurious wakeup is harmless: woken waiters re-evaluate the futex
+value and re-arm FUTEX_WAITERS before sleeping again, which also
+repairs the wiped bit for the remaining sleepers.
 
-The replay is deliberately not suppressed when the futex value carries
-FUTEX_WAITERS by the time the walk runs. In glibc's mutex protocol an
-observed bit would already guarantee a future wakeup - the bit is only
-ever cleared by an unlock which issues a wakeup - but that is a
-convention of glibc's unlock path, not an obligation the robust futex
-ABI places on lock owners: the documented protocol only requires the
-waiter side to arm the bit before sleeping. Suppressing the replay
-would silently bake the owner side convention into the kernel, while
-an occasional unnecessary wakeup is harmless for every conforming
-protocol.
+If FUTEX_WAITERS is set again by the time the walk runs, no wakeup
+needs to be replayed: within the protocol the bit is only ever cleared
+by an unlock which issues a wakeup (lock attempts and the exit walk
+itself preserve it), so an observed FUTEX_WAITERS guarantees a future
+wakeup from the live owner's unlock and the chain is already intact.
+This also holds when the task which re-armed the bit dies before
+sleeping - the bit stays behind either way. This meaning of the bit is
+part of the non PI robust futex ABI, not merely libc convention: the
+exit walk itself preserves FUTEX_WAITERS when it marks a dead owner's
+futex (mval) and issues its own wakeup only when the bit is set, so
+the kernel already requires unlock paths to honor an armed bit.
 
 The window was found by model checking the robust futex wait/wake
 interactions with TLC. A deterministic selftest is added in the
@@ -69,7 +71,7 @@ Signed-off-by: Keno Fischer <keno@juliahub.com>
  1 file changed, 23 insertions(+), 1 deletion(-)
 
 diff --git a/kernel/futex/core.c b/kernel/futex/core.c
-index 179b26e9c934..b21c42cbea18 100644
+index 179b26e9c934..e1a8772e4d48 100644
 --- a/kernel/futex/core.c
 +++ b/kernel/futex/core.c
 @@ -1025,8 +1025,30 @@ static int handle_futex_death(u32 __user *uaddr, struct task_struct *curr,
@@ -87,16 +89,16 @@ index 179b26e9c934..b21c42cbea18 100644
 +		 * uncontended fast path and never wake the remaining
 +		 * waiters. Nothing may be modified here - the lock has a
 +		 * live owner - but a potential waiter must be woken to keep
-+		 * the wake up chain alive. The wake up is issued even if
-+		 * the futex value carries FUTEX_WAITERS again: the ABI only
-+		 * obliges waiters to arm the bit before sleeping; whether an
-+		 * owner may clear it without waking is protocol convention,
-+		 * so the bit proves nothing about future wake ups. The woken
-+		 * waiter re-evaluates the futex value and re-arms
-+		 * FUTEX_WAITERS before waiting again, so a spurious wake up
-+		 * is harmless.
++		 * the wake up chain alive. This is not needed once
++		 * FUTEX_WAITERS is re-armed: the bit is only ever cleared
++		 * by an unlock which issues a wake up (lock attempts and
++		 * this walk preserve it), so an observed FUTEX_WAITERS
++		 * guarantees a future wake up from the owner's unlock and
++		 * no wake up was consumed. The woken waiter re-evaluates
++		 * the futex value and re-arms FUTEX_WAITERS before waiting
++		 * again, so a spurious wake up is harmless.
 +		 */
-+		if (pending_op && !pi)
++		if (pending_op && !pi && !(uval & FUTEX_WAITERS))
 +			futex_wake(uaddr, FLAGS_SIZE_32 | FLAGS_SHARED, NULL, 1,
 +				   FUTEX_BITSET_MATCH_ANY);
  		return 0;

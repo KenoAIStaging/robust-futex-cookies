@@ -1,0 +1,356 @@
+TLC2 Version 2026.07.15.134331 (rev: 227f61b)
+Running breadth-first search Model-Checking with fp 124 and seed 4865865069444228499 with 128 workers on 128 cores with 27305MB heap and 64MB offheap memory [pid: 259037] (Linux 6.8.0-134-generic amd64, Debian 11.0.24 64bit, MSBDiskFPSet, DiskStateQueue).
+Parsing file /workspace/robust-futex-work/tla/MCCounterOrigDesign.tla
+Parsing file /workspace/robust-futex-work/tla/CounterMutex.tla
+Parsing file /tmp/tlc-3348528408067349162/_TLCTrace.tla (jar:file:/workspace/robust-futex-work/tla/tla2tools.jar!/tla2sany/StandardModules/_TLCTrace.tla)
+Parsing file /tmp/tlc-3348528408067349162/Naturals.tla (jar:file:/workspace/robust-futex-work/tla/tla2tools.jar!/tla2sany/StandardModules/Naturals.tla)
+Parsing file /tmp/tlc-3348528408067349162/FiniteSets.tla (jar:file:/workspace/robust-futex-work/tla/tla2tools.jar!/tla2sany/StandardModules/FiniteSets.tla)
+Parsing file /tmp/tlc-3348528408067349162/Sequences.tla (jar:file:/workspace/robust-futex-work/tla/tla2tools.jar!/tla2sany/StandardModules/Sequences.tla)
+Parsing file /tmp/tlc-3348528408067349162/TLC.tla (jar:file:/workspace/robust-futex-work/tla/tla2tools.jar!/tla2sany/StandardModules/TLC.tla)
+Parsing file /tmp/tlc-3348528408067349162/TLCExt.tla (jar:file:/workspace/robust-futex-work/tla/tla2tools.jar!/tla2sany/StandardModules/TLCExt.tla)
+Parsing file /tmp/tlc-3348528408067349162/Integers.tla (jar:file:/workspace/robust-futex-work/tla/tla2tools.jar!/tla2sany/StandardModules/Integers.tla)
+Semantic processing of module Naturals
+Semantic processing of module Sequences
+Semantic processing of module FiniteSets
+Semantic processing of module CounterMutex
+Semantic processing of module TLC
+Semantic processing of module Integers
+Semantic processing of module TLCExt
+Semantic processing of module _TLCTrace
+Semantic processing of module MCCounterOrigDesign
+Linting of module CounterMutex
+Linting of module TLCExt
+Linting of module _TLCTrace
+Linting of module MCCounterOrigDesign
+Starting... (2026-07-18 03:54:20)
+Computing initial states...
+Finished computing initial states: 1 distinct state generated at 2026-07-18 03:54:20.
+Error: Invariant NoCorruption is violated.
+Error: The behavior up to this point is:
+State 1: <Initial predicate>
+/\ corrupt = FALSE
+/\ ctr = 1
+/\ rgen = (t1 :> 0 @@ t2 :> 0)
+/\ word = [own |-> 0, od |-> FALSE]
+/\ alive = (t1 :> TRUE @@ t2 :> TRUE)
+/\ ecookie = 0
+/\ cleaned = (t1 :> FALSE @@ t2 :> FALSE)
+/\ pc = (t1 :> "idle" @@ t2 :> "idle")
+/\ qgen = 0
+/\ pending = (t1 :> FALSE @@ t2 :> FALSE)
+/\ pcookie = (t1 :> 0 @@ t2 :> 0)
+/\ res = (t1 :> 0 @@ t2 :> 0)
+/\ guard = (t1 :> FALSE @@ t2 :> FALSE)
+/\ enq = (t1 :> FALSE @@ t2 :> FALSE)
+/\ owner = "none_"
+
+State 2: <Arm(t1) line 122, col 5 to line 126, col 55 of module CounterMutex>
+/\ corrupt = FALSE
+/\ ctr = 1
+/\ rgen = (t1 :> 0 @@ t2 :> 0)
+/\ word = [own |-> 0, od |-> FALSE]
+/\ alive = (t1 :> TRUE @@ t2 :> TRUE)
+/\ ecookie = 0
+/\ cleaned = (t1 :> FALSE @@ t2 :> FALSE)
+/\ pc = (t1 :> "armed" @@ t2 :> "idle")
+/\ qgen = 0
+/\ pending = (t1 :> FALSE @@ t2 :> FALSE)
+/\ pcookie = (t1 :> 0 @@ t2 :> 0)
+/\ res = (t1 :> 0 @@ t2 :> 0)
+/\ guard = (t1 :> TRUE @@ t2 :> FALSE)
+/\ enq = (t1 :> FALSE @@ t2 :> FALSE)
+/\ owner = "none_"
+
+State 3: <Arm(t2) line 122, col 5 to line 126, col 55 of module CounterMutex>
+/\ corrupt = FALSE
+/\ ctr = 1
+/\ rgen = (t1 :> 0 @@ t2 :> 0)
+/\ word = [own |-> 0, od |-> FALSE]
+/\ alive = (t1 :> TRUE @@ t2 :> TRUE)
+/\ ecookie = 0
+/\ cleaned = (t1 :> FALSE @@ t2 :> FALSE)
+/\ pc = (t1 :> "armed" @@ t2 :> "armed")
+/\ qgen = 0
+/\ pending = (t1 :> FALSE @@ t2 :> FALSE)
+/\ pcookie = (t1 :> 0 @@ t2 :> 0)
+/\ res = (t1 :> 0 @@ t2 :> 0)
+/\ guard = (t1 :> TRUE @@ t2 :> TRUE)
+/\ enq = (t1 :> FALSE @@ t2 :> FALSE)
+/\ owner = "none_"
+
+State 4: <Reserve(t2) line 130, col 5 to line 136, col 41 of module CounterMutex>
+/\ corrupt = FALSE
+/\ ctr = 2
+/\ rgen = (t1 :> 0 @@ t2 :> 0)
+/\ word = [own |-> 0, od |-> FALSE]
+/\ alive = (t1 :> TRUE @@ t2 :> TRUE)
+/\ ecookie = 0
+/\ cleaned = (t1 :> FALSE @@ t2 :> FALSE)
+/\ pc = (t1 :> "armed" @@ t2 :> "reserved")
+/\ qgen = 0
+/\ pending = (t1 :> FALSE @@ t2 :> FALSE)
+/\ pcookie = (t1 :> 0 @@ t2 :> 0)
+/\ res = (t1 :> 0 @@ t2 :> 1)
+/\ guard = (t1 :> TRUE @@ t2 :> TRUE)
+/\ enq = (t1 :> FALSE @@ t2 :> FALSE)
+/\ owner = "none_"
+
+State 5: <GatePass(t2) line 152, col 5 to line 156, col 55 of module CounterMutex>
+/\ corrupt = FALSE
+/\ ctr = 2
+/\ rgen = (t1 :> 0 @@ t2 :> 0)
+/\ word = [own |-> 0, od |-> FALSE]
+/\ alive = (t1 :> TRUE @@ t2 :> TRUE)
+/\ ecookie = 0
+/\ cleaned = (t1 :> FALSE @@ t2 :> FALSE)
+/\ pc = (t1 :> "armed" @@ t2 :> "setpc")
+/\ qgen = 0
+/\ pending = (t1 :> FALSE @@ t2 :> FALSE)
+/\ pcookie = (t1 :> 0 @@ t2 :> 0)
+/\ res = (t1 :> 0 @@ t2 :> 1)
+/\ guard = (t1 :> TRUE @@ t2 :> TRUE)
+/\ enq = (t1 :> FALSE @@ t2 :> FALSE)
+/\ owner = "none_"
+
+State 6: <Reserve(t1) line 130, col 5 to line 136, col 41 of module CounterMutex>
+/\ corrupt = FALSE
+/\ ctr = 3
+/\ rgen = (t1 :> 1 @@ t2 :> 0)
+/\ word = [own |-> 0, od |-> FALSE]
+/\ alive = (t1 :> TRUE @@ t2 :> TRUE)
+/\ ecookie = 0
+/\ cleaned = (t1 :> FALSE @@ t2 :> FALSE)
+/\ pc = (t1 :> "reserved" @@ t2 :> "setpc")
+/\ qgen = 0
+/\ pending = (t1 :> FALSE @@ t2 :> FALSE)
+/\ pcookie = (t1 :> 0 @@ t2 :> 0)
+/\ res = (t1 :> 2 @@ t2 :> 1)
+/\ guard = (t1 :> TRUE @@ t2 :> TRUE)
+/\ enq = (t1 :> FALSE @@ t2 :> FALSE)
+/\ owner = "none_"
+
+State 7: <GateFail(t1) line 161, col 5 to line 166, col 55 of module CounterMutex>
+/\ corrupt = FALSE
+/\ ctr = 3
+/\ rgen = (t1 :> 1 @@ t2 :> 0)
+/\ word = [own |-> 0, od |-> FALSE]
+/\ alive = (t1 :> TRUE @@ t2 :> TRUE)
+/\ ecookie = 0
+/\ cleaned = (t1 :> FALSE @@ t2 :> FALSE)
+/\ pc = (t1 :> "fence" @@ t2 :> "setpc")
+/\ qgen = 0
+/\ pending = (t1 :> FALSE @@ t2 :> FALSE)
+/\ pcookie = (t1 :> 0 @@ t2 :> 0)
+/\ res = (t1 :> 2 @@ t2 :> 1)
+/\ guard = (t1 :> FALSE @@ t2 :> TRUE)
+/\ enq = (t1 :> FALSE @@ t2 :> FALSE)
+/\ owner = "none_"
+
+State 8: <DoFence(t1) line 174, col 5 to line 178, col 55 of module CounterMutex>
+/\ corrupt = FALSE
+/\ ctr = 3
+/\ rgen = (t1 :> 1 @@ t2 :> 0)
+/\ word = [own |-> 0, od |-> FALSE]
+/\ alive = (t1 :> TRUE @@ t2 :> TRUE)
+/\ ecookie = 0
+/\ cleaned = (t1 :> FALSE @@ t2 :> FALSE)
+/\ pc = (t1 :> "fstore" @@ t2 :> "setpc")
+/\ qgen = 0
+/\ pending = (t1 :> FALSE @@ t2 :> FALSE)
+/\ pcookie = (t1 :> 0 @@ t2 :> 0)
+/\ res = (t1 :> 2 @@ t2 :> 1)
+/\ guard = (t1 :> FALSE @@ t2 :> FALSE)
+/\ enq = (t1 :> FALSE @@ t2 :> FALSE)
+/\ owner = "none_"
+
+State 9: <StoreGate(t1) line 184, col 5 to line 190, col 55 of module CounterMutex>
+/\ corrupt = FALSE
+/\ ctr = 3
+/\ rgen = (t1 :> 1 @@ t2 :> 0)
+/\ word = [own |-> 0, od |-> FALSE]
+/\ alive = (t1 :> TRUE @@ t2 :> TRUE)
+/\ ecookie = 0
+/\ cleaned = (t1 :> FALSE @@ t2 :> FALSE)
+/\ pc = (t1 :> "idle" @@ t2 :> "setpc")
+/\ qgen = 1
+/\ pending = (t1 :> FALSE @@ t2 :> FALSE)
+/\ pcookie = (t1 :> 0 @@ t2 :> 0)
+/\ res = (t1 :> 2 @@ t2 :> 1)
+/\ guard = (t1 :> FALSE @@ t2 :> FALSE)
+/\ enq = (t1 :> FALSE @@ t2 :> FALSE)
+/\ owner = "none_"
+
+State 10: <Arm(t1) line 122, col 5 to line 126, col 55 of module CounterMutex>
+/\ corrupt = FALSE
+/\ ctr = 3
+/\ rgen = (t1 :> 1 @@ t2 :> 0)
+/\ word = [own |-> 0, od |-> FALSE]
+/\ alive = (t1 :> TRUE @@ t2 :> TRUE)
+/\ ecookie = 0
+/\ cleaned = (t1 :> FALSE @@ t2 :> FALSE)
+/\ pc = (t1 :> "armed" @@ t2 :> "setpc")
+/\ qgen = 1
+/\ pending = (t1 :> FALSE @@ t2 :> FALSE)
+/\ pcookie = (t1 :> 0 @@ t2 :> 0)
+/\ res = (t1 :> 2 @@ t2 :> 1)
+/\ guard = (t1 :> TRUE @@ t2 :> FALSE)
+/\ enq = (t1 :> FALSE @@ t2 :> FALSE)
+/\ owner = "none_"
+
+State 11: <Reserve(t1) line 130, col 5 to line 136, col 41 of module CounterMutex>
+/\ corrupt = FALSE
+/\ ctr = 4
+/\ rgen = (t1 :> 1 @@ t2 :> 0)
+/\ word = [own |-> 0, od |-> FALSE]
+/\ alive = (t1 :> TRUE @@ t2 :> TRUE)
+/\ ecookie = 0
+/\ cleaned = (t1 :> FALSE @@ t2 :> FALSE)
+/\ pc = (t1 :> "reserved" @@ t2 :> "setpc")
+/\ qgen = 1
+/\ pending = (t1 :> FALSE @@ t2 :> FALSE)
+/\ pcookie = (t1 :> 0 @@ t2 :> 0)
+/\ res = (t1 :> 3 @@ t2 :> 1)
+/\ guard = (t1 :> TRUE @@ t2 :> FALSE)
+/\ enq = (t1 :> FALSE @@ t2 :> FALSE)
+/\ owner = "none_"
+
+State 12: <SetPCookie(t2) line 195, col 5 to line 200, col 41 of module CounterMutex>
+/\ corrupt = FALSE
+/\ ctr = 4
+/\ rgen = (t1 :> 1 @@ t2 :> 0)
+/\ word = [own |-> 0, od |-> FALSE]
+/\ alive = (t1 :> TRUE @@ t2 :> TRUE)
+/\ ecookie = 1
+/\ cleaned = (t1 :> FALSE @@ t2 :> FALSE)
+/\ pc = (t1 :> "reserved" @@ t2 :> "ready")
+/\ qgen = 1
+/\ pending = (t1 :> FALSE @@ t2 :> FALSE)
+/\ pcookie = (t1 :> 0 @@ t2 :> 1)
+/\ res = (t1 :> 3 @@ t2 :> 1)
+/\ guard = (t1 :> TRUE @@ t2 :> FALSE)
+/\ enq = (t1 :> FALSE @@ t2 :> FALSE)
+/\ owner = "none_"
+
+State 13: <GatePass(t1) line 152, col 5 to line 156, col 55 of module CounterMutex>
+/\ corrupt = FALSE
+/\ ctr = 4
+/\ rgen = (t1 :> 1 @@ t2 :> 0)
+/\ word = [own |-> 0, od |-> FALSE]
+/\ alive = (t1 :> TRUE @@ t2 :> TRUE)
+/\ ecookie = 1
+/\ cleaned = (t1 :> FALSE @@ t2 :> FALSE)
+/\ pc = (t1 :> "setpc" @@ t2 :> "ready")
+/\ qgen = 1
+/\ pending = (t1 :> FALSE @@ t2 :> FALSE)
+/\ pcookie = (t1 :> 0 @@ t2 :> 1)
+/\ res = (t1 :> 3 @@ t2 :> 1)
+/\ guard = (t1 :> TRUE @@ t2 :> FALSE)
+/\ enq = (t1 :> FALSE @@ t2 :> FALSE)
+/\ owner = "none_"
+
+State 14: <VdsoArm(t2) line 204, col 5 to line 208, col 46 of module CounterMutex>
+/\ corrupt = FALSE
+/\ ctr = 4
+/\ rgen = (t1 :> 1 @@ t2 :> 0)
+/\ word = [own |-> 0, od |-> FALSE]
+/\ alive = (t1 :> TRUE @@ t2 :> TRUE)
+/\ ecookie = 1
+/\ cleaned = (t1 :> FALSE @@ t2 :> FALSE)
+/\ pc = (t1 :> "setpc" @@ t2 :> "inhelper")
+/\ qgen = 1
+/\ pending = (t1 :> FALSE @@ t2 :> TRUE)
+/\ pcookie = (t1 :> 0 @@ t2 :> 1)
+/\ res = (t1 :> 3 @@ t2 :> 1)
+/\ guard = (t1 :> TRUE @@ t2 :> FALSE)
+/\ enq = (t1 :> FALSE @@ t2 :> FALSE)
+/\ owner = "none_"
+
+State 15: <SetPCookie(t1) line 195, col 5 to line 200, col 41 of module CounterMutex>
+/\ corrupt = FALSE
+/\ ctr = 4
+/\ rgen = (t1 :> 1 @@ t2 :> 0)
+/\ word = [own |-> 0, od |-> FALSE]
+/\ alive = (t1 :> TRUE @@ t2 :> TRUE)
+/\ ecookie = 3
+/\ cleaned = (t1 :> FALSE @@ t2 :> FALSE)
+/\ pc = (t1 :> "ready" @@ t2 :> "inhelper")
+/\ qgen = 1
+/\ pending = (t1 :> FALSE @@ t2 :> TRUE)
+/\ pcookie = (t1 :> 3 @@ t2 :> 1)
+/\ res = (t1 :> 3 @@ t2 :> 1)
+/\ guard = (t1 :> TRUE @@ t2 :> FALSE)
+/\ enq = (t1 :> FALSE @@ t2 :> FALSE)
+/\ owner = "none_"
+
+State 16: <VdsoArm(t1) line 204, col 5 to line 208, col 46 of module CounterMutex>
+/\ corrupt = FALSE
+/\ ctr = 4
+/\ rgen = (t1 :> 1 @@ t2 :> 0)
+/\ word = [own |-> 0, od |-> FALSE]
+/\ alive = (t1 :> TRUE @@ t2 :> TRUE)
+/\ ecookie = 3
+/\ cleaned = (t1 :> FALSE @@ t2 :> FALSE)
+/\ pc = (t1 :> "inhelper" @@ t2 :> "inhelper")
+/\ qgen = 1
+/\ pending = (t1 :> TRUE @@ t2 :> TRUE)
+/\ pcookie = (t1 :> 3 @@ t2 :> 1)
+/\ res = (t1 :> 3 @@ t2 :> 1)
+/\ guard = (t1 :> TRUE @@ t2 :> FALSE)
+/\ enq = (t1 :> FALSE @@ t2 :> FALSE)
+/\ owner = "none_"
+
+State 17: <Die(t2) line 284, col 5 to line 287, col 55 of module CounterMutex>
+/\ corrupt = FALSE
+/\ ctr = 4
+/\ rgen = (t1 :> 1 @@ t2 :> 0)
+/\ word = [own |-> 0, od |-> FALSE]
+/\ alive = (t1 :> TRUE @@ t2 :> FALSE)
+/\ ecookie = 3
+/\ cleaned = (t1 :> FALSE @@ t2 :> FALSE)
+/\ pc = (t1 :> "inhelper" @@ t2 :> "inhelper")
+/\ qgen = 1
+/\ pending = (t1 :> TRUE @@ t2 :> TRUE)
+/\ pcookie = (t1 :> 3 @@ t2 :> 1)
+/\ res = (t1 :> 3 @@ t2 :> 1)
+/\ guard = (t1 :> TRUE @@ t2 :> FALSE)
+/\ enq = (t1 :> FALSE @@ t2 :> FALSE)
+/\ owner = "none_"
+
+State 18: <VdsoCommit(t1) line 214, col 5 to line 226, col 18 of module CounterMutex>
+/\ corrupt = FALSE
+/\ ctr = 4
+/\ rgen = (t1 :> 1 @@ t2 :> 0)
+/\ word = [own |-> 3, od |-> FALSE]
+/\ alive = (t1 :> TRUE @@ t2 :> FALSE)
+/\ ecookie = 3
+/\ cleaned = (t1 :> FALSE @@ t2 :> FALSE)
+/\ pc = (t1 :> "acquired" @@ t2 :> "inhelper")
+/\ qgen = 1
+/\ pending = (t1 :> TRUE @@ t2 :> TRUE)
+/\ pcookie = (t1 :> 3 @@ t2 :> 1)
+/\ res = (t1 :> 3 @@ t2 :> 1)
+/\ guard = (t1 :> FALSE @@ t2 :> FALSE)
+/\ enq = (t1 :> FALSE @@ t2 :> FALSE)
+/\ owner = t1
+
+State 19: <KernelCleanup(t2) line 298, col 5 to line 310, col 33 of module CounterMutex>
+/\ corrupt = TRUE
+/\ ctr = 4
+/\ rgen = (t1 :> 1 @@ t2 :> 0)
+/\ word = [own |-> 0, od |-> TRUE]
+/\ alive = (t1 :> TRUE @@ t2 :> FALSE)
+/\ ecookie = 3
+/\ cleaned = (t1 :> FALSE @@ t2 :> TRUE)
+/\ pc = (t1 :> "acquired" @@ t2 :> "inhelper")
+/\ qgen = 1
+/\ pending = (t1 :> TRUE @@ t2 :> TRUE)
+/\ pcookie = (t1 :> 3 @@ t2 :> 1)
+/\ res = (t1 :> 3 @@ t2 :> 1)
+/\ guard = (t1 :> FALSE @@ t2 :> FALSE)
+/\ enq = (t1 :> FALSE @@ t2 :> FALSE)
+/\ owner = t1
+
+55966 states generated, 23579 distinct states found, 5501 states left on queue.
+The depth of the complete state graph search is 22.
+Finished in 02s at (2026-07-18 03:54:22)
+Trace exploration spec path: ./MCCounterOrigDesign_TTrace_1784346860.tla

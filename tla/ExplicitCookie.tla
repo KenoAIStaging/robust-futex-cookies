@@ -60,15 +60,6 @@
 (*     through the uncontended fast path (the "lost waiter" bug fixed in  *)
 (*     rfmutex's rfm_lock_explicit()/rfm_lock_counter()).                 *)
 (*                                                                         *)
-(*   StrictWaiters = TRUE models a ROBUST_LIST_WAITERS_STRICT             *)
-(*     registration: the exit cleanup's owner mismatch replay of a        *)
-(*     possibly consumed wake up is suppressed while the lock word        *)
-(*     carries WAITERS. This is sound for protocols whose owners only     *)
-(*     ever clear the bit with a waking unlock (this spec's unlock does,  *)
-(*     as do glibc and rfmutex); the kernel default (FALSE) replays       *)
-(*     unconditionally because the ABI demands no such owner discipline.  *)
-(*     Both variants pass NoLostWakeup exhaustively.                      *)
-(*                                                                         *)
 (*   UseAllocator = FALSE disables the allocator: threads use the fixed   *)
 (*     identifier FixedId[t] with no lease at all. Duplicate FixedId      *)
 (*     values model the classic TID protocol with a TID collision across  *)
@@ -86,11 +77,7 @@ CONSTANTS
     PendingFirst,   \* BOOLEAN: fixed vs historical kernel walk order
     LeaseLast,      \* BOOLEAN: slot entry ordered after all held locks
     WakeOnCleanup,  \* BOOLEAN: kernel cleanup wakes a waiter (real kernel)
-    WaitedBit,      \* BOOLEAN: a woken waiter re-asserts WAITERS on acquire
-    StrictWaiters   \* BOOLEAN: ROBUST_LIST_WAITERS_STRICT registration:
-                    \* the pending op mismatch replay is suppressed while
-                    \* the word carries WAITERS (the modeled protocol's
-                    \* owners only clear the bit with a waking unlock)
+    WaitedBit       \* BOOLEAN: a woken waiter re-asserts WAITERS on acquire
 
 NONE == "none"
 
@@ -377,15 +364,11 @@ CleanupPending(t) ==
        \* the chain) and an owner mismatch (the woken waiter died
        \* after another owner re-acquired; that owner will unlock
        \* through the uncontended fast path, so the dying task's
-       \* consumed wake up must be replayed). The kernel default
-       \* replays the mismatch wake unconditionally: the ABI does not
-       \* oblige owners to clear WAITERS only via a waking unlock, so
-       \* an observed bit proves nothing. With StrictWaiters (a
-       \* ROBUST_LIST_WAITERS_STRICT registration) the protocol
-       \* declares exactly that owner discipline - this spec's unlock
-       \* honors it - so a re-armed WAITERS already guarantees a
-       \* future wake and the replay is suppressed.
-       THEN /\ IF WakeOnCleanup /\ (word.own = 0 \/ ~StrictWaiters \/ ~word.wtr)
+       \* consumed wake up must be replayed - but only while WAITERS
+       \* is not re-armed: an observed WAITERS bit is only ever
+       \* cleared by an unlock which wakes, so the chain is already
+       \* intact and no wake up was consumed).
+       THEN /\ IF WakeOnCleanup /\ (word.own = 0 \/ ~word.wtr)
                THEN pc' \in Wake1(pc)
                ELSE pc' = pc
             /\ UNCHANGED <<word, corrupt, owner>>

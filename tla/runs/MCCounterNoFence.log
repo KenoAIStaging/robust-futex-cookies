@@ -1,0 +1,37 @@
+TLC2 Version 2026.07.15.134331 (rev: 227f61b)
+Running breadth-first search Model-Checking with fp 72 and seed 8434131220382383162 with 128 workers on 128 cores with 27305MB heap and 64MB offheap memory [pid: 257984] (Linux 6.8.0-134-generic amd64, Debian 11.0.24 64bit, MSBDiskFPSet, DiskStateQueue).
+Parsing file /workspace/robust-futex-work/tla/MCCounterNoFence.tla
+Parsing file /workspace/robust-futex-work/tla/CounterMutex.tla
+Parsing file /tmp/tlc-536866282158805210/_TLCTrace.tla (jar:file:/workspace/robust-futex-work/tla/tla2tools.jar!/tla2sany/StandardModules/_TLCTrace.tla)
+Parsing file /tmp/tlc-536866282158805210/Naturals.tla (jar:file:/workspace/robust-futex-work/tla/tla2tools.jar!/tla2sany/StandardModules/Naturals.tla)
+Parsing file /tmp/tlc-536866282158805210/FiniteSets.tla (jar:file:/workspace/robust-futex-work/tla/tla2tools.jar!/tla2sany/StandardModules/FiniteSets.tla)
+Parsing file /tmp/tlc-536866282158805210/Sequences.tla (jar:file:/workspace/robust-futex-work/tla/tla2tools.jar!/tla2sany/StandardModules/Sequences.tla)
+Parsing file /tmp/tlc-536866282158805210/TLC.tla (jar:file:/workspace/robust-futex-work/tla/tla2tools.jar!/tla2sany/StandardModules/TLC.tla)
+Parsing file /tmp/tlc-536866282158805210/TLCExt.tla (jar:file:/workspace/robust-futex-work/tla/tla2tools.jar!/tla2sany/StandardModules/TLCExt.tla)
+Parsing file /tmp/tlc-536866282158805210/Integers.tla (jar:file:/workspace/robust-futex-work/tla/tla2tools.jar!/tla2sany/StandardModules/Integers.tla)
+Semantic processing of module Naturals
+Semantic processing of module Sequences
+Semantic processing of module FiniteSets
+Semantic processing of module CounterMutex
+Semantic processing of module TLC
+Semantic processing of module Integers
+Semantic processing of module TLCExt
+Semantic processing of module _TLCTrace
+Semantic processing of module MCCounterNoFence
+Linting of module CounterMutex
+Linting of module TLCExt
+Linting of module _TLCTrace
+Linting of module MCCounterNoFence
+Starting... (2026-07-18 03:52:19)
+Computing initial states...
+Finished computing initial states: 1 distinct state generated at 2026-07-18 03:52:19.
+Progress(32) at 2026-07-18 03:52:22: 439,760 states generated (439,760 s/min), 172,425 distinct states found (172,425 ds/min), 28,936 states left on queue.
+Model checking completed. No error has been found.
+  Estimates of the probability that TLC did not check all reachable states
+  because two distinct states had the same fingerprint:
+  calculated (optimistic):  val = 8.7E-6
+  based on the actual fingerprints:  val = 1.6E-6
+26670697 states generated, 9244071 distinct states found, 0 states left on queue.
+The depth of the complete state graph search is 73.
+The average outdegree of the complete state graph is 1 (minimum is 0, the maximum 6 and the 95th percentile is 3).
+Finished in 44s at (2026-07-18 03:53:04)

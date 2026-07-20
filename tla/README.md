@@ -23,8 +23,7 @@ analogue of the 30-bit space with the generation in bit 29).
   kernel walk order (`PendingFirst`), the lease position in the list
   (`LeaseLast`), the pending attribution ABI (`PendingViaHead`), fixed
   TID-style identifiers (`UseAllocator`), the cleanup wake
-  (`WakeOnCleanup`), the WAITERS re-assertion (`WaitedBit`) and the
-  `ROBUST_LIST_WAITERS_STRICT` replay suppression (`StrictWaiters`).
+  (`WakeOnCleanup`) and the WAITERS re-assertion (`WaitedBit`).
 
 - `CounterMutex.tla` — the per mutex reservation counter protocol: RSEQ
   guard ("no event since armed" detector), the vDSO cmpxchg helper with
@@ -62,8 +61,7 @@ artifact provenance).
 
 | Config                | Models                                            | Result |
 |-----------------------|---------------------------------------------------|--------|
-| MCExplicitOK          | final ABI + fixed walk order (pending first) + lease-last list order + cleanup wake + WAITERS re-assertion; unconditional mismatch replay (kernel default); 3 threads, 3 leased cookies, waiters modeled | PASS, exhaustive, deadlock checking on: TypeOK/NoCorruption/Exclusion + Recovery + NoLostWakeup; 115.2M generated / 33.5M distinct |
-| MCExplicitOKStrict    | as OK but `StrictWaiters`: the mismatch replay is suppressed while the word carries WAITERS (`ROBUST_LIST_WAITERS_STRICT`, the rfmutex registration) | PASS, exhaustive, deadlock checking on: same properties; 114.9M generated / 33.5M distinct |
+| MCExplicitOK          | final ABI + fixed walk order (pending first) + lease-last list order + cleanup wake + WAITERS re-assertion; 3 threads, 3 leased cookies, waiters modeled | PASS, exhaustive, deadlock checking on: TypeOK/NoCorruption/Exclusion + Recovery + NoLostWakeup; 114.9M generated / 33.5M distinct (with the WAITERS-guarded mismatch replay) |
 | MCExplicitNoWake      | as OK but the exit cleanup never wakes             | NoLostWakeup **violated** (sleeping waiters never woken after owner death) |
 | MCExplicitLostWaiter  | as OK but woken acquirers do not re-assert WAITERS | NoLostWakeup **violated** (the lost waiter bug: kernel unlock wiped the bit, the woken waiter's fast-path unlock strands the rest) |
 | MCExplicitLeaseABA    | as OK but historical walk order (entries, then pending) | NoCorruption **violated** (lease released before the stale pending op: issue #1) |
@@ -148,15 +146,11 @@ artifact provenance).
    futex wait loop must re-assert WAITERS whenever it observes an owned
    lock (a waiter that could "spin without re-asserting" does not exist
    in the code and produces spurious strands in the model). The
-   owner-mismatch replay is checked in both kernel variants: the
-   unconditional default (the ABI obliges only waiters to arm
-   WAITERS, so an observed bit carries no owner side wakeup promise)
-   and the `ROBUST_LIST_WAITERS_STRICT` suppression on an armed bit
-   (`MCExplicitOKStrict`, `StrictWaiters`), which is sound for
-   protocols whose owners only ever clear the bit with a waking
-   unlock - the spec's unlock does, as do glibc and rfmutex, which
-   registers with the flag. Both variants pass NoLostWakeup
-   exhaustively; the negative variants fail under either. Per-waiter
+   owner-mismatch replay, by contrast, is correctly *guarded* on the
+   WAITERS bit: an observed bit is only ever cleared by an unlock which
+   wakes, so it already guarantees a future wakeup from the live owner
+   - TLC confirms NoLostWakeup with the replay restricted to
+   WAITERS-free values (and the negative variants still fail). Per-waiter
    starvation freedom is deliberately not claimed: with FUTEX_WAKE(1)
    and no wake ordering promise, TLC exhibits the classic starvation
    lasso, which is inherent to futex based locks. The owner-mismatch

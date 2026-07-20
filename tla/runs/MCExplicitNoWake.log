@@ -1,0 +1,243 @@
+TLC2 Version 2026.07.15.134331 (rev: 227f61b)
+Running breadth-first search Model-Checking with fp 94 and seed -4437344836415402111 with 128 workers on 128 cores with 27305MB heap and 64MB offheap memory [pid: 256132] (Linux 6.8.0-134-generic amd64, Debian 11.0.24 64bit, MSBDiskFPSet, DiskStateQueue).
+Parsing file /workspace/robust-futex-work/tla/MCExplicitNoWake.tla
+Parsing file /workspace/robust-futex-work/tla/ExplicitCookie.tla
+Parsing file /tmp/tlc-2113683351081802968/_TLCTrace.tla (jar:file:/workspace/robust-futex-work/tla/tla2tools.jar!/tla2sany/StandardModules/_TLCTrace.tla)
+Parsing file /tmp/tlc-2113683351081802968/Naturals.tla (jar:file:/workspace/robust-futex-work/tla/tla2tools.jar!/tla2sany/StandardModules/Naturals.tla)
+Parsing file /tmp/tlc-2113683351081802968/FiniteSets.tla (jar:file:/workspace/robust-futex-work/tla/tla2tools.jar!/tla2sany/StandardModules/FiniteSets.tla)
+Parsing file /tmp/tlc-2113683351081802968/Sequences.tla (jar:file:/workspace/robust-futex-work/tla/tla2tools.jar!/tla2sany/StandardModules/Sequences.tla)
+Parsing file /tmp/tlc-2113683351081802968/TLC.tla (jar:file:/workspace/robust-futex-work/tla/tla2tools.jar!/tla2sany/StandardModules/TLC.tla)
+Parsing file /tmp/tlc-2113683351081802968/TLCExt.tla (jar:file:/workspace/robust-futex-work/tla/tla2tools.jar!/tla2sany/StandardModules/TLCExt.tla)
+Parsing file /tmp/tlc-2113683351081802968/Integers.tla (jar:file:/workspace/robust-futex-work/tla/tla2tools.jar!/tla2sany/StandardModules/Integers.tla)
+Semantic processing of module Naturals
+Semantic processing of module Sequences
+Semantic processing of module FiniteSets
+Semantic processing of module ExplicitCookie
+Semantic processing of module TLC
+Semantic processing of module Integers
+Semantic processing of module TLCExt
+Semantic processing of module _TLCTrace
+Semantic processing of module MCExplicitNoWake
+Linting of module ExplicitCookie
+Linting of module TLCExt
+Linting of module _TLCTrace
+Linting of module MCExplicitNoWake
+Starting... (2026-07-18 03:47:16)
+Implied-temporal checking--satisfiability problem has 1 branches.
+Computing initial states...
+Finished computing initial states: 1 distinct state generated at 2026-07-18 03:47:16.
+Checking temporal properties for the current state space with 38504 total distinct states at (2026-07-18 03:47:19)
+Error: Temporal property NoLostWakeup was violated.
+
+Error: The following behavior constitutes a counter-example:
+
+State 1: <Initial predicate>
+/\ corrupt = FALSE
+/\ done_e = (t1 :> FALSE @@ t2 :> FALSE @@ t3 :> FALSE)
+/\ done_p = (t1 :> FALSE @@ t2 :> FALSE @@ t3 :> FALSE)
+/\ done_s = (t1 :> FALSE @@ t2 :> FALSE @@ t3 :> FALSE)
+/\ word = [own |-> 0, od |-> FALSE, wtr |-> FALSE]
+/\ alive = (t1 :> TRUE @@ t2 :> TRUE @@ t3 :> TRUE)
+/\ ecookie = 0
+/\ pc = (t1 :> "unattached" @@ t2 :> "unattached" @@ t3 :> "unattached")
+/\ waited = (t1 :> FALSE @@ t2 :> FALSE @@ t3 :> FALSE)
+/\ pending = (t1 :> FALSE @@ t2 :> FALSE @@ t3 :> FALSE)
+/\ pcookie = (t1 :> 0 @@ t2 :> 0 @@ t3 :> 0)
+/\ lease = (t1 :> FALSE @@ t2 :> FALSE @@ t3 :> FALSE)
+/\ enq = (t1 :> FALSE @@ t2 :> FALSE @@ t3 :> FALSE)
+/\ cookie = (t1 :> 0 @@ t2 :> 0 @@ t3 :> 0)
+/\ owner = "none"
+
+State 2: <Attach(t2) line 166, col 5 to line 176, col 59 of module ExplicitCookie>
+/\ corrupt = FALSE
+/\ done_e = (t1 :> FALSE @@ t2 :> FALSE @@ t3 :> FALSE)
+/\ done_p = (t1 :> FALSE @@ t2 :> FALSE @@ t3 :> FALSE)
+/\ done_s = (t1 :> FALSE @@ t2 :> FALSE @@ t3 :> FALSE)
+/\ word = [own |-> 0, od |-> FALSE, wtr |-> FALSE]
+/\ alive = (t1 :> TRUE @@ t2 :> TRUE @@ t3 :> TRUE)
+/\ ecookie = 0
+/\ pc = (t1 :> "unattached" @@ t2 :> "idle" @@ t3 :> "unattached")
+/\ waited = (t1 :> FALSE @@ t2 :> FALSE @@ t3 :> FALSE)
+/\ pending = (t1 :> FALSE @@ t2 :> FALSE @@ t3 :> FALSE)
+/\ pcookie = (t1 :> 0 @@ t2 :> 0 @@ t3 :> 0)
+/\ lease = (t1 :> FALSE @@ t2 :> TRUE @@ t3 :> FALSE)
+/\ enq = (t1 :> FALSE @@ t2 :> FALSE @@ t3 :> FALSE)
+/\ cookie = (t1 :> 0 @@ t2 :> 3 @@ t3 :> 0)
+/\ owner = "none"
+
+State 3: <StartAcq(t2) line 186, col 5 to line 193, col 35 of module ExplicitCookie>
+/\ corrupt = FALSE
+/\ done_e = (t1 :> FALSE @@ t2 :> FALSE @@ t3 :> FALSE)
+/\ done_p = (t1 :> FALSE @@ t2 :> FALSE @@ t3 :> FALSE)
+/\ done_s = (t1 :> FALSE @@ t2 :> FALSE @@ t3 :> FALSE)
+/\ word = [own |-> 0, od |-> FALSE, wtr |-> FALSE]
+/\ alive = (t1 :> TRUE @@ t2 :> TRUE @@ t3 :> TRUE)
+/\ ecookie = 0
+/\ pc = (t1 :> "unattached" @@ t2 :> "acq" @@ t3 :> "unattached")
+/\ waited = (t1 :> FALSE @@ t2 :> FALSE @@ t3 :> FALSE)
+/\ pending = (t1 :> FALSE @@ t2 :> TRUE @@ t3 :> FALSE)
+/\ pcookie = (t1 :> 0 @@ t2 :> 3 @@ t3 :> 0)
+/\ lease = (t1 :> FALSE @@ t2 :> TRUE @@ t3 :> FALSE)
+/\ enq = (t1 :> FALSE @@ t2 :> FALSE @@ t3 :> FALSE)
+/\ cookie = (t1 :> 0 @@ t2 :> 3 @@ t3 :> 0)
+/\ owner = "none"
+
+State 4: <Acquire(t2) line 197, col 5 to line 204, col 60 of module ExplicitCookie>
+/\ corrupt = FALSE
+/\ done_e = (t1 :> FALSE @@ t2 :> FALSE @@ t3 :> FALSE)
+/\ done_p = (t1 :> FALSE @@ t2 :> FALSE @@ t3 :> FALSE)
+/\ done_s = (t1 :> FALSE @@ t2 :> FALSE @@ t3 :> FALSE)
+/\ word = [own |-> 3, od |-> FALSE, wtr |-> FALSE]
+/\ alive = (t1 :> TRUE @@ t2 :> TRUE @@ t3 :> TRUE)
+/\ ecookie = 0
+/\ pc = (t1 :> "unattached" @@ t2 :> "acquired" @@ t3 :> "unattached")
+/\ waited = (t1 :> FALSE @@ t2 :> FALSE @@ t3 :> FALSE)
+/\ pending = (t1 :> FALSE @@ t2 :> TRUE @@ t3 :> FALSE)
+/\ pcookie = (t1 :> 0 @@ t2 :> 3 @@ t3 :> 0)
+/\ lease = (t1 :> FALSE @@ t2 :> TRUE @@ t3 :> FALSE)
+/\ enq = (t1 :> FALSE @@ t2 :> FALSE @@ t3 :> FALSE)
+/\ cookie = (t1 :> 0 @@ t2 :> 3 @@ t3 :> 0)
+/\ owner = t2
+
+State 5: <Die(t2) line 308, col 5 to line 313, col 59 of module ExplicitCookie>
+/\ corrupt = FALSE
+/\ done_e = (t1 :> FALSE @@ t2 :> FALSE @@ t3 :> FALSE)
+/\ done_p = (t1 :> FALSE @@ t2 :> FALSE @@ t3 :> FALSE)
+/\ done_s = (t1 :> FALSE @@ t2 :> FALSE @@ t3 :> FALSE)
+/\ word = [own |-> 3, od |-> FALSE, wtr |-> FALSE]
+/\ alive = (t1 :> TRUE @@ t2 :> FALSE @@ t3 :> TRUE)
+/\ ecookie = 0
+/\ pc = (t1 :> "unattached" @@ t2 :> "acquired" @@ t3 :> "unattached")
+/\ waited = (t1 :> FALSE @@ t2 :> FALSE @@ t3 :> FALSE)
+/\ pending = (t1 :> FALSE @@ t2 :> TRUE @@ t3 :> FALSE)
+/\ pcookie = (t1 :> 0 @@ t2 :> 3 @@ t3 :> 0)
+/\ lease = (t1 :> FALSE @@ t2 :> TRUE @@ t3 :> FALSE)
+/\ enq = (t1 :> FALSE @@ t2 :> FALSE @@ t3 :> FALSE)
+/\ cookie = (t1 :> 0 @@ t2 :> 3 @@ t3 :> 0)
+/\ owner = t2
+
+State 6: <Attach(t1) line 166, col 5 to line 176, col 59 of module ExplicitCookie>
+/\ corrupt = FALSE
+/\ done_e = (t1 :> FALSE @@ t2 :> FALSE @@ t3 :> FALSE)
+/\ done_p = (t1 :> FALSE @@ t2 :> FALSE @@ t3 :> FALSE)
+/\ done_s = (t1 :> FALSE @@ t2 :> FALSE @@ t3 :> FALSE)
+/\ word = [own |-> 3, od |-> FALSE, wtr |-> FALSE]
+/\ alive = (t1 :> TRUE @@ t2 :> FALSE @@ t3 :> TRUE)
+/\ ecookie = 0
+/\ pc = (t1 :> "idle" @@ t2 :> "acquired" @@ t3 :> "unattached")
+/\ waited = (t1 :> FALSE @@ t2 :> FALSE @@ t3 :> FALSE)
+/\ pending = (t1 :> FALSE @@ t2 :> TRUE @@ t3 :> FALSE)
+/\ pcookie = (t1 :> 0 @@ t2 :> 3 @@ t3 :> 0)
+/\ lease = (t1 :> TRUE @@ t2 :> TRUE @@ t3 :> FALSE)
+/\ enq = (t1 :> FALSE @@ t2 :> FALSE @@ t3 :> FALSE)
+/\ cookie = (t1 :> 2 @@ t2 :> 3 @@ t3 :> 0)
+/\ owner = t2
+
+State 7: <StartAcq(t1) line 186, col 5 to line 193, col 35 of module ExplicitCookie>
+/\ corrupt = FALSE
+/\ done_e = (t1 :> FALSE @@ t2 :> FALSE @@ t3 :> FALSE)
+/\ done_p = (t1 :> FALSE @@ t2 :> FALSE @@ t3 :> FALSE)
+/\ done_s = (t1 :> FALSE @@ t2 :> FALSE @@ t3 :> FALSE)
+/\ word = [own |-> 3, od |-> FALSE, wtr |-> FALSE]
+/\ alive = (t1 :> TRUE @@ t2 :> FALSE @@ t3 :> TRUE)
+/\ ecookie = 0
+/\ pc = (t1 :> "acq" @@ t2 :> "acquired" @@ t3 :> "unattached")
+/\ waited = (t1 :> FALSE @@ t2 :> FALSE @@ t3 :> FALSE)
+/\ pending = (t1 :> TRUE @@ t2 :> TRUE @@ t3 :> FALSE)
+/\ pcookie = (t1 :> 2 @@ t2 :> 3 @@ t3 :> 0)
+/\ lease = (t1 :> TRUE @@ t2 :> TRUE @@ t3 :> FALSE)
+/\ enq = (t1 :> FALSE @@ t2 :> FALSE @@ t3 :> FALSE)
+/\ cookie = (t1 :> 2 @@ t2 :> 3 @@ t3 :> 0)
+/\ owner = t2
+
+State 8: <Attach(t3) line 166, col 5 to line 176, col 59 of module ExplicitCookie>
+/\ corrupt = FALSE
+/\ done_e = (t1 :> FALSE @@ t2 :> FALSE @@ t3 :> FALSE)
+/\ done_p = (t1 :> FALSE @@ t2 :> FALSE @@ t3 :> FALSE)
+/\ done_s = (t1 :> FALSE @@ t2 :> FALSE @@ t3 :> FALSE)
+/\ word = [own |-> 3, od |-> FALSE, wtr |-> FALSE]
+/\ alive = (t1 :> TRUE @@ t2 :> FALSE @@ t3 :> TRUE)
+/\ ecookie = 0
+/\ pc = (t1 :> "acq" @@ t2 :> "acquired" @@ t3 :> "idle")
+/\ waited = (t1 :> FALSE @@ t2 :> FALSE @@ t3 :> FALSE)
+/\ pending = (t1 :> TRUE @@ t2 :> TRUE @@ t3 :> FALSE)
+/\ pcookie = (t1 :> 2 @@ t2 :> 3 @@ t3 :> 0)
+/\ lease = (t1 :> TRUE @@ t2 :> TRUE @@ t3 :> TRUE)
+/\ enq = (t1 :> FALSE @@ t2 :> FALSE @@ t3 :> FALSE)
+/\ cookie = (t1 :> 2 @@ t2 :> 3 @@ t3 :> 1)
+/\ owner = t2
+
+State 9: <Sleep(t1) line 222, col 5 to line 228, col 59 of module ExplicitCookie>
+/\ corrupt = FALSE
+/\ done_e = (t1 :> FALSE @@ t2 :> FALSE @@ t3 :> FALSE)
+/\ done_p = (t1 :> FALSE @@ t2 :> FALSE @@ t3 :> FALSE)
+/\ done_s = (t1 :> FALSE @@ t2 :> FALSE @@ t3 :> FALSE)
+/\ word = [own |-> 3, od |-> FALSE, wtr |-> TRUE]
+/\ alive = (t1 :> TRUE @@ t2 :> FALSE @@ t3 :> TRUE)
+/\ ecookie = 0
+/\ pc = (t1 :> "sleeping" @@ t2 :> "acquired" @@ t3 :> "idle")
+/\ waited = (t1 :> TRUE @@ t2 :> FALSE @@ t3 :> FALSE)
+/\ pending = (t1 :> TRUE @@ t2 :> TRUE @@ t3 :> FALSE)
+/\ pcookie = (t1 :> 2 @@ t2 :> 3 @@ t3 :> 0)
+/\ lease = (t1 :> TRUE @@ t2 :> TRUE @@ t3 :> TRUE)
+/\ enq = (t1 :> FALSE @@ t2 :> FALSE @@ t3 :> FALSE)
+/\ cookie = (t1 :> 2 @@ t2 :> 3 @@ t3 :> 1)
+/\ owner = t2
+
+State 10: <CleanupPending(t2) line 357, col 5 to line 394, col 43 of module ExplicitCookie>
+/\ corrupt = FALSE
+/\ done_e = (t1 :> FALSE @@ t2 :> FALSE @@ t3 :> FALSE)
+/\ done_p = (t1 :> FALSE @@ t2 :> TRUE @@ t3 :> FALSE)
+/\ done_s = (t1 :> FALSE @@ t2 :> FALSE @@ t3 :> FALSE)
+/\ word = [own |-> 0, od |-> TRUE, wtr |-> TRUE]
+/\ alive = (t1 :> TRUE @@ t2 :> FALSE @@ t3 :> TRUE)
+/\ ecookie = 0
+/\ pc = (t1 :> "sleeping" @@ t2 :> "acquired" @@ t3 :> "idle")
+/\ waited = (t1 :> TRUE @@ t2 :> FALSE @@ t3 :> FALSE)
+/\ pending = (t1 :> TRUE @@ t2 :> TRUE @@ t3 :> FALSE)
+/\ pcookie = (t1 :> 2 @@ t2 :> 3 @@ t3 :> 0)
+/\ lease = (t1 :> TRUE @@ t2 :> TRUE @@ t3 :> TRUE)
+/\ enq = (t1 :> FALSE @@ t2 :> FALSE @@ t3 :> FALSE)
+/\ cookie = (t1 :> 2 @@ t2 :> 3 @@ t3 :> 1)
+/\ owner = "none"
+
+State 11: <CleanupEntry(t2) line 335, col 5 to line 353, col 43 of module ExplicitCookie>
+/\ corrupt = FALSE
+/\ done_e = (t1 :> FALSE @@ t2 :> TRUE @@ t3 :> FALSE)
+/\ done_p = (t1 :> FALSE @@ t2 :> TRUE @@ t3 :> FALSE)
+/\ done_s = (t1 :> FALSE @@ t2 :> FALSE @@ t3 :> FALSE)
+/\ word = [own |-> 0, od |-> TRUE, wtr |-> TRUE]
+/\ alive = (t1 :> TRUE @@ t2 :> FALSE @@ t3 :> TRUE)
+/\ ecookie = 0
+/\ pc = (t1 :> "sleeping" @@ t2 :> "acquired" @@ t3 :> "idle")
+/\ waited = (t1 :> TRUE @@ t2 :> FALSE @@ t3 :> FALSE)
+/\ pending = (t1 :> TRUE @@ t2 :> TRUE @@ t3 :> FALSE)
+/\ pcookie = (t1 :> 2 @@ t2 :> 3 @@ t3 :> 0)
+/\ lease = (t1 :> TRUE @@ t2 :> TRUE @@ t3 :> TRUE)
+/\ enq = (t1 :> FALSE @@ t2 :> FALSE @@ t3 :> FALSE)
+/\ cookie = (t1 :> 2 @@ t2 :> 3 @@ t3 :> 1)
+/\ owner = "none"
+
+State 12: <CleanupSlot(t2) line 325, col 5 to line 330, col 59 of module ExplicitCookie>
+/\ corrupt = FALSE
+/\ done_e = (t1 :> FALSE @@ t2 :> TRUE @@ t3 :> FALSE)
+/\ done_p = (t1 :> FALSE @@ t2 :> TRUE @@ t3 :> FALSE)
+/\ done_s = (t1 :> FALSE @@ t2 :> TRUE @@ t3 :> FALSE)
+/\ word = [own |-> 0, od |-> TRUE, wtr |-> TRUE]
+/\ alive = (t1 :> TRUE @@ t2 :> FALSE @@ t3 :> TRUE)
+/\ ecookie = 0
+/\ pc = (t1 :> "sleeping" @@ t2 :> "acquired" @@ t3 :> "idle")
+/\ waited = (t1 :> TRUE @@ t2 :> FALSE @@ t3 :> FALSE)
+/\ pending = (t1 :> TRUE @@ t2 :> TRUE @@ t3 :> FALSE)
+/\ pcookie = (t1 :> 2 @@ t2 :> 3 @@ t3 :> 0)
+/\ lease = (t1 :> TRUE @@ t2 :> FALSE @@ t3 :> TRUE)
+/\ enq = (t1 :> FALSE @@ t2 :> FALSE @@ t3 :> FALSE)
+/\ cookie = (t1 :> 2 @@ t2 :> 3 @@ t3 :> 1)
+/\ owner = "none"
+
+State 13: Stuttering
+Finished checking temporal properties in 00s at 2026-07-18 03:47:19
+162634 states generated, 66112 distinct states found, 27608 states left on queue.
+The depth of the complete state graph search is 16.
+Finished in 03s at (2026-07-18 03:47:19)
+Trace exploration spec path: ./MCExplicitNoWake_TTrace_1784346436.tla

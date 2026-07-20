@@ -42,9 +42,6 @@ struct robust_list_head2 {
 };
 #define ROBUST_LIST_COOKIE	(0x1UL)
 #endif
-#ifndef ROBUST_LIST_WAITERS_STRICT
-#define ROBUST_LIST_WAITERS_STRICT	(0x2UL)
-#endif
 
 /*
  * Library owned, layout compatible representation of the kernel's
@@ -325,17 +322,7 @@ static int rfm_thread_init_common(void)
 	t->h.futex_offset = (ssize_t)offsetof(rfmutex_t, word) -
 			    (ssize_t)offsetof(rfmutex_t, next);
 	atomic_store_explicit(&t->h.list_op_pending, 0, memory_order_relaxed);
-	/*
-	 * WAITERS_STRICT: rfmutex owners only ever clear FUTEX_WAITERS
-	 * with an unlock which issues a wakeup (rfm_unlock's exchange +
-	 * conditional wake; the wait loop re-arms the bit on every owned
-	 * observation before sleeping). Under that discipline an armed
-	 * bit already guarantees a future wakeup, so the kernel's exit
-	 * time consumed-wakeup replay is redundant and suppressed. The
-	 * TLA+ model verifies NoLostWakeup for exactly this variant
-	 * (MCExplicitOKStrict).
-	 */
-	t->h.flags = ROBUST_LIST_COOKIE | ROBUST_LIST_WAITERS_STRICT;
+	t->h.flags = ROBUST_LIST_COOKIE;
 	t->h.cookie_offset = (ssize_t)offsetof(rfmutex_t, cookie) -
 			     (ssize_t)offsetof(rfmutex_t, next);
 	if (sys_set_robust_list2((struct robust_list_head2 *)&t->h))

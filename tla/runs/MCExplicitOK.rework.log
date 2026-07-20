@@ -1,0 +1,63 @@
+TLC2 Version 2026.07.15.134331 (rev: 227f61b)
+Running breadth-first search Model-Checking with fp 65 and seed -8560978926988738745 with 24 workers on 128 cores with 27305MB heap and 64MB offheap memory [pid: 203855] (Linux 6.8.0-134-generic amd64, Debian 11.0.24 64bit, MSBDiskFPSet, DiskStateQueue).
+Parsing file /workspace/robust-futex-work/tla/MCExplicitOK.tla
+Parsing file /workspace/robust-futex-work/tla/ExplicitCookie.tla
+Parsing file /tmp/tlc-11361877995165542009/_TLCTrace.tla (jar:file:/workspace/robust-futex-work/tla/tla2tools.jar!/tla2sany/StandardModules/_TLCTrace.tla)
+Parsing file /tmp/tlc-11361877995165542009/Naturals.tla (jar:file:/workspace/robust-futex-work/tla/tla2tools.jar!/tla2sany/StandardModules/Naturals.tla)
+Parsing file /tmp/tlc-11361877995165542009/FiniteSets.tla (jar:file:/workspace/robust-futex-work/tla/tla2tools.jar!/tla2sany/StandardModules/FiniteSets.tla)
+Parsing file /tmp/tlc-11361877995165542009/Sequences.tla (jar:file:/workspace/robust-futex-work/tla/tla2tools.jar!/tla2sany/StandardModules/Sequences.tla)
+Parsing file /tmp/tlc-11361877995165542009/TLC.tla (jar:file:/workspace/robust-futex-work/tla/tla2tools.jar!/tla2sany/StandardModules/TLC.tla)
+Parsing file /tmp/tlc-11361877995165542009/TLCExt.tla (jar:file:/workspace/robust-futex-work/tla/tla2tools.jar!/tla2sany/StandardModules/TLCExt.tla)
+Parsing file /tmp/tlc-11361877995165542009/Integers.tla (jar:file:/workspace/robust-futex-work/tla/tla2tools.jar!/tla2sany/StandardModules/Integers.tla)
+Semantic processing of module Naturals
+Semantic processing of module Sequences
+Semantic processing of module FiniteSets
+Semantic processing of module ExplicitCookie
+Semantic processing of module TLC
+Semantic processing of module Integers
+Semantic processing of module TLCExt
+Semantic processing of module _TLCTrace
+Semantic processing of module MCExplicitOK
+Linting of module ExplicitCookie
+Linting of module TLCExt
+Linting of module _TLCTrace
+Linting of module MCExplicitOK
+Starting... (2026-07-18 01:35:25)
+Implied-temporal checking--satisfiability problem has 4 branches.
+Computing initial states...
+Finished computing initial states: 1 distinct state generated at 2026-07-18 01:35:25.
+Checking 4 branches of temporal properties for the current state space with 166645 total distinct states at (2026-07-18 01:35:29)
+Finished checking temporal properties in 00s at 2026-07-18 01:35:29
+Progress(14) at 2026-07-18 01:35:29: 112,626 states generated (112,626 s/min), 46,779 distinct states found (46,779 ds/min), 20,468 states left on queue.
+Checking 4 branches of temporal properties for the current state space with 10349366 total distinct states at (2026-07-18 01:36:29)
+Finished checking temporal properties in 47s at 2026-07-18 01:37:17
+Progress(24) at 2026-07-18 01:37:17: 7,797,970 states generated (7,685,344 s/min), 2,761,479 distinct states found (2,714,700 ds/min), 696,544 states left on queue.
+Progress(27) at 2026-07-18 01:38:17: 15,385,361 states generated (7,587,391 s/min), 5,250,771 distinct states found (2,489,292 ds/min), 1,080,005 states left on queue.
+Progress(29) at 2026-07-18 01:39:17: 22,630,651 states generated (7,245,290 s/min), 7,529,299 distinct states found (2,278,528 ds/min), 1,308,895 states left on queue.
+Progress(30) at 2026-07-18 01:40:17: 30,130,478 states generated (7,499,827 s/min), 9,835,793 distinct states found (2,306,494 ds/min), 1,471,826 states left on queue.
+Checking 4 branches of temporal properties for the current state space with 46559421 total distinct states at (2026-07-18 01:41:17)
+Finished checking temporal properties in 04min 34s at 2026-07-18 01:45:52
+Progress(32) at 2026-07-18 01:45:52: 37,414,932 states generated (7,284,454 s/min), 12,031,213 distinct states found (2,195,420 ds/min), 1,565,425 states left on queue.
+Progress(33) at 2026-07-18 01:46:52: 44,467,148 states generated (7,052,216 s/min), 14,134,509 distinct states found (2,103,296 ds/min), 1,620,304 states left on queue.
+Progress(34) at 2026-07-18 01:47:52: 51,303,347 states generated (6,836,199 s/min), 16,145,041 distinct states found (2,010,532 ds/min), 1,636,755 states left on queue.
+Progress(36) at 2026-07-18 01:48:52: 58,469,477 states generated (7,166,130 s/min), 18,220,363 distinct states found (2,075,322 ds/min), 1,612,428 states left on queue.
+Progress(37) at 2026-07-18 01:49:52: 65,643,381 states generated (7,173,904 s/min), 20,273,782 distinct states found (2,053,419 ds/min), 1,552,867 states left on queue.
+Progress(38) at 2026-07-18 01:50:52: 72,831,448 states generated (7,188,067 s/min), 22,336,777 distinct states found (2,062,995 ds/min), 1,509,849 states left on queue.
+Progress(40) at 2026-07-18 01:51:52: 80,155,740 states generated (7,324,292 s/min), 24,392,854 distinct states found (2,056,077 ds/min), 1,406,627 states left on queue.
+Progress(41) at 2026-07-18 01:52:52: 86,474,642 states generated (6,318,902 s/min), 26,149,027 distinct states found (1,756,173 ds/min), 1,292,498 states left on queue.
+Progress(43) at 2026-07-18 01:53:52: 93,674,885 states generated (7,200,243 s/min), 28,099,746 distinct states found (1,950,719 ds/min), 1,100,840 states left on queue.
+Progress(45) at 2026-07-18 01:54:52: 101,208,912 states generated (7,534,027 s/min), 30,085,299 distinct states found (1,985,553 ds/min), 828,728 states left on queue.
+Progress(48) at 2026-07-18 01:55:52: 108,718,766 states generated (7,509,854 s/min), 31,969,103 distinct states found (1,883,804 ds/min), 433,646 states left on queue.
+Progress(66) at 2026-07-18 01:56:45: 115,192,261 states generated, 33,530,403 distinct states found, 0 states left on queue.
+Checking 4 branches of temporal properties for the complete state space with 134121612 total distinct states at (2026-07-18 01:56:45)
+Finished checking temporal properties in 14min 30s at 2026-07-18 02:11:15
+Model checking completed. No error has been found.
+  Estimates of the probability that TLC did not check all reachable states
+  because two distinct states had the same fingerprint:
+  calculated (optimistic):  val = 1.5E-4
+  based on the actual fingerprints:  val = .0095
+115192261 states generated, 33530403 distinct states found, 0 states left on queue.
+The depth of the complete state graph search is 66.
+The average outdegree of the complete state graph is 1 (minimum is 0, the maximum 9 and the 95th percentile is 2).
+Finished in 35min 56s at (2026-07-18 02:11:21)
+EXIT:0
