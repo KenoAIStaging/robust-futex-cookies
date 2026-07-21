@@ -1,4 +1,4 @@
-From b94be74b43c4b7041690e8858bc548976d296548 Mon Sep 17 00:00:00 2001
+From 352e81b3a374e38d8d1e54c28e4f9ff84a91db7c Mon Sep 17 00:00:00 2001
 From: Keno Fischer <keno@juliahub.com>
 Date: Thu, 16 Jul 2026 08:20:22 +0000
 Subject: [PATCH 4/8] selftests/futex: Add robust list cookie tests

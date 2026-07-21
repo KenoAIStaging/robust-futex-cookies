@@ -1,4 +1,4 @@
-From 70e8b84158fd1f3655c7945162e2c539e660efa7 Mon Sep 17 00:00:00 2001
+From 0f322e9b07ebbcd4a588025525f11b5e6be2e37e Mon Sep 17 00:00:00 2001
 From: Keno Fischer <keno@juliahub.com>
 Date: Thu, 16 Jul 2026 08:22:29 +0000
 Subject: [PATCH 5/8] futex/vdso: Implement
@@ -665,10 +665,10 @@ index 3cd175eefe64..249393857134 100644
 +
  #endif
 diff --git a/kernel/futex/core.c b/kernel/futex/core.c
-index 1f431cc9fee6..a10307cbe470 100644
+index 5e75bf92b7a7..e1602f39efd4 100644
 --- a/kernel/futex/core.c
 +++ b/kernel/futex/core.c
-@@ -1609,11 +1609,116 @@ void __futex_fixup_robust_unlock(struct pt_regs *regs, struct futex_unlock_cs_ra
+@@ -1594,11 +1594,116 @@ void __futex_fixup_robust_unlock(struct pt_regs *regs, struct futex_unlock_cs_ra
  	futex_robust_list_clear_pending(pop, csr->pop_size32 ? FLAGS_ROBUST_LIST32 : 0);
  }
  
@@ -786,7 +786,7 @@ index 1f431cc9fee6..a10307cbe470 100644
  		exit_robust_list(tsk);
  		tsk->futex.robust_list = NULL;
  		tsk->futex.robust_list_flags = 0;
-@@ -1621,6 +1726,7 @@ static void futex_cleanup(struct task_struct *tsk)
+@@ -1606,6 +1711,7 @@ static void futex_cleanup(struct task_struct *tsk)
  
  #ifdef CONFIG_COMPAT
  	if (unlikely(tsk->futex.compat_robust_list)) {
@@ -794,7 +794,7 @@ index 1f431cc9fee6..a10307cbe470 100644
  		compat_exit_robust_list(tsk);
  		tsk->futex.compat_robust_list = NULL;
  		tsk->futex.compat_robust_list_flags = 0;
-@@ -2147,13 +2253,15 @@ static void futex_invalidate_cs_ranges(struct futex_mm_data *fd)
+@@ -2132,13 +2238,15 @@ static void futex_invalidate_cs_ranges(struct futex_mm_data *fd)
  	 * tasks as they use VDSO32 which does not provide the 64-bit pointer
  	 * variant.
  	 */

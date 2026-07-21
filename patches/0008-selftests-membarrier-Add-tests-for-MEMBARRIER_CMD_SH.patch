@@ -1,4 +1,4 @@
-From 3511bedcf0ceafc89244389539e5083a62063e33 Mon Sep 17 00:00:00 2001
+From 062d0a60e88ba9b8ffe5035ca0b7841b1a9989b0 Mon Sep 17 00:00:00 2001
 From: Keno Fischer <keno@juliahub.com>
 Date: Thu, 16 Jul 2026 08:23:02 +0000
 Subject: [PATCH 8/8] selftests/membarrier: Add tests for

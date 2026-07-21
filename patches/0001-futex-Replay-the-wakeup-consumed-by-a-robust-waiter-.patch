@@ -1,4 +1,4 @@
-From 11149366a2ed5e669477f1aa2da46818af178b7b Mon Sep 17 00:00:00 2001
+From adbf2cebde437f417952781eb033c6308fa26f9f Mon Sep 17 00:00:00 2001
 From: Keno Fischer <keno@juliahub.com>
 Date: Fri, 17 Jul 2026 22:38:42 +0000
 Subject: [PATCH 1/8] futex: Replay the wakeup consumed by a robust waiter
@@ -35,14 +35,17 @@ to handle exactly this scenario - its comment spells out "a woken up
 waiter is killed before it can acquire the futex in user space" - but
 only covers it while the futex value is still 0 when the exit walk
 runs. If the futex was re-acquired first, the owner mismatch check
-discards the pending op, and the consumed wakeup with it. Complete the
-handling for the owner mismatch case: when a pending non PI lock
-operation of the dying task is discarded because the futex is owned by
-someone else and the futex value does not carry FUTEX_WAITERS, wake
-one waiter. The futex value is not touched - the owner is alive - and
-a spurious wakeup is harmless: woken waiters re-evaluate the futex
-value and re-arm FUTEX_WAITERS before sleeping again, which also
-repairs the wiped bit for the remaining sleepers.
+discards the pending op, and the consumed wakeup with it. Both are the
+same situation - a pending lock operation on a futex the dying task
+does not own, whose wakeup may have been consumed - so fold the owner
+mismatch case into that special case: wake one waiter whenever a
+pending non PI lock operation is discarded because the owner part of
+the futex value does not match the dying task, unless the value
+carries a live owner together with FUTEX_WAITERS. The futex value is
+not touched either way, and a spurious wakeup is harmless: woken
+waiters re-evaluate the futex value and re-arm FUTEX_WAITERS before
+sleeping again, which also repairs the wiped bit for the remaining
+sleepers.
 
 If FUTEX_WAITERS is set again by the time the walk runs, no wakeup
 needs to be replayed: within the protocol the bit is only ever cleared
@@ -67,45 +70,102 @@ responsibility for the changes.
 Fixes: ca16d5bee598 ("futex: Prevent robust futex exit race")
 Signed-off-by: Keno Fischer <keno@juliahub.com>
 ---
- kernel/futex/core.c | 24 +++++++++++++++++++++++-
- 1 file changed, 23 insertions(+), 1 deletion(-)
+ kernel/futex/core.c | 67 +++++++++++++++++++++++++--------------------
+ 1 file changed, 37 insertions(+), 30 deletions(-)
 
 diff --git a/kernel/futex/core.c b/kernel/futex/core.c
-index 179b26e9c934..e1a8772e4d48 100644
+index 179b26e9c934..add8ade29e47 100644
 --- a/kernel/futex/core.c
 +++ b/kernel/futex/core.c
-@@ -1025,8 +1025,30 @@ static int handle_futex_death(u32 __user *uaddr, struct task_struct *curr,
+@@ -982,8 +982,10 @@ static int handle_futex_death(u32 __user *uaddr, struct task_struct *curr,
+ 		return -1;
+ 
+ 	/*
+-	 * Special case for regular (non PI) futexes. The unlock path in
+-	 * user space has two race scenarios:
++	 * Special case for regular (non PI) futexes: the dying task holds
++	 * a pending lock operation (@pending_op == true) on a futex whose
++	 * owner part does not match its TID. The unlock path in user
++	 * space has two race scenarios leading here:
+ 	 *
+ 	 * 1. The unlock path releases the user space futex value and
+ 	 *    before it can execute the futex() syscall to wake up
+@@ -992,42 +994,47 @@ static int handle_futex_death(u32 __user *uaddr, struct task_struct *curr,
+ 	 * 2. A woken up waiter is killed before it can acquire the
+ 	 *    futex in user space.
+ 	 *
+-	 * In the second case, the wake up notification could be generated
+-	 * by the unlock path in user space after setting the futex value
+-	 * to zero or by the kernel after setting the OWNER_DIED bit below.
++	 * In the first case the futex value is 0. In the second case it
++	 * may be 0, carry OWNER_DIED (set by this walk running for an
++	 * earlier death), or carry the TID of a third task which
++	 * re-acquired the futex through the uncontended fast path after
++	 * the robust unlock - which stored 0 over the whole futex value,
++	 * wiping FUTEX_WAITERS - woke the now dying waiter.
+ 	 *
+-	 * In both cases the TID validation below prevents a wakeup of
+-	 * potential waiters which can cause these waiters to block
+-	 * forever.
++	 * The futex value must not be touched: a zero value is a
++	 * consistent unlocked state which a woken waiter just takes over
++	 * (setting the OWNER_DIED bit would create inconsistent state
++	 * and malfunction of the user space owner died handling), an
++	 * OWNER_DIED value is already being dealt with by its waiters,
++	 * and a foreign TID is a lock with a live owner.
+ 	 *
+-	 * In both cases the following conditions are met:
+-	 *
+-	 *	1) task->futex.robust_list->list_op_pending != NULL
+-	 *	   @pending_op == true
+-	 *	2) The owner part of user space futex value == 0
+-	 *	3) Regular futex: @pi == false
+-	 *
+-	 * If these conditions are met, it is safe to attempt waking up a
+-	 * potential waiter without touching the user space futex value and
+-	 * trying to set the OWNER_DIED bit. If the futex value is zero,
+-	 * the rest of the user space mutex state is consistent, so a woken
+-	 * waiter will just take over the uncontended futex. Setting the
+-	 * OWNER_DIED bit would create inconsistent state and malfunction
+-	 * of the user space owner died handling. Otherwise, the OWNER_DIED
+-	 * bit is already set, and the woken waiter is expected to deal with
+-	 * this.
++	 * But without the TID validation below suppressing them, this
++	 * walk would have generated a wake up - and the dying task may
++	 * have consumed exactly one wake up which nobody else will
++	 * re-issue: the notification of the robust unlock in scenario 2.
++	 * Replay it, or the remaining waiters block forever behind an
++	 * owner which will never see contention; a spurious wake up is
++	 * harmless, as woken waiters re-evaluate the futex value and
++	 * re-arm FUTEX_WAITERS before sleeping again. The replay is not
++	 * needed while the futex value carries a live owner and
++	 * FUTEX_WAITERS: the bit is only ever cleared by an unlock which
++	 * issues a wake up (lock attempts and this walk preserve it), so
++	 * an observed FUTEX_WAITERS guarantees a future wake up from the
++	 * owner's unlock and no wake up was consumed. For a released
++	 * futex value the wake up is unconditional - the unlock which
++	 * released it wiped the bit, and there is no owner whose future
++	 * unlock could deliver a wake up.
+ 	 */
+ 	owner = uval & FUTEX_TID_MASK;
+ 
+-	if (pending_op && !pi && !owner) {
+-		futex_wake(uaddr, FLAGS_SIZE_32 | FLAGS_SHARED, NULL, 1,
+-			   FUTEX_BITSET_MATCH_ANY);
++	if (owner != task_pid_vnr(curr)) {
++		if (pending_op && !pi &&
++		    (!owner || !(uval & FUTEX_WAITERS)))
++			futex_wake(uaddr, FLAGS_SIZE_32 | FLAGS_SHARED, NULL, 1,
++				   FUTEX_BITSET_MATCH_ANY);
  		return 0;
  	}
  
 -	if (owner != task_pid_vnr(curr))
-+	if (owner != task_pid_vnr(curr)) {
-+		/*
-+		 * The dying task's pending op may have consumed the wake up
-+		 * notification of a robust unlock: woken, then killed before
-+		 * it could act on it. The robust unlock wiped the whole
-+		 * futex value including FUTEX_WAITERS, so the owner which
-+		 * re-acquired the lock afterwards will unlock through the
-+		 * uncontended fast path and never wake the remaining
-+		 * waiters. Nothing may be modified here - the lock has a
-+		 * live owner - but a potential waiter must be woken to keep
-+		 * the wake up chain alive. This is not needed once
-+		 * FUTEX_WAITERS is re-armed: the bit is only ever cleared
-+		 * by an unlock which issues a wake up (lock attempts and
-+		 * this walk preserve it), so an observed FUTEX_WAITERS
-+		 * guarantees a future wake up from the owner's unlock and
-+		 * no wake up was consumed. The woken waiter re-evaluates
-+		 * the futex value and re-arms FUTEX_WAITERS before waiting
-+		 * again, so a spurious wake up is harmless.
-+		 */
-+		if (pending_op && !pi && !(uval & FUTEX_WAITERS))
-+			futex_wake(uaddr, FLAGS_SIZE_32 | FLAGS_SHARED, NULL, 1,
-+				   FUTEX_BITSET_MATCH_ANY);
- 		return 0;
-+	}
- 
+-		return 0;
+-
  	/*
  	 * Ok, this dying thread is truly holding a futex
+ 	 * of interest. Set the OWNER_DIED bit atomically
 -- 
 2.54.0
 

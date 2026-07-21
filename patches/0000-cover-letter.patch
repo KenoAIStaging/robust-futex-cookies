@@ -1,6 +1,6 @@
-From 3511bedcf0ceafc89244389539e5083a62063e33 Mon Sep 17 00:00:00 2001
+From 062d0a60e88ba9b8ffe5035ca0b7841b1a9989b0 Mon Sep 17 00:00:00 2001
 From: Keno Fischer <keno@juliahub.com>
-Date: Mon, 20 Jul 2026 22:41:55 +0000
+Date: Tue, 21 Jul 2026 00:00:19 +0000
 Subject: [PATCH 0/8] futex: PID namespace agnostic robust futexes via owner cookies
 
 Robust futexes identify the lock owner by storing the owner's TID in the
@@ -150,7 +150,7 @@ Keno Fischer (8):
  include/uapi/linux/futex.h                    |   69 +
  include/uapi/linux/membarrier.h               |   34 +
  include/vdso/futex.h                          |   91 +
- kernel/futex/core.c                           |  346 +++-
+ kernel/futex/core.c                           |  389 ++++-
  kernel/futex/futex.h                          |    9 +
  kernel/futex/syscalls.c                       |  129 +-
  kernel/sched/membarrier.c                     |  269 ++-
@@ -158,7 +158,7 @@ Keno Fischer (8):
  tools/testing/selftests/membarrier/.gitignore |    1 +
  tools/testing/selftests/membarrier/Makefile   |    6 +
  .../membarrier/membarrier_shared_rseq_test.c  |  432 +++++
- 28 files changed, 3224 insertions(+), 50 deletions(-)
+ 28 files changed, 3238 insertions(+), 79 deletions(-)
  create mode 100644 Documentation/litmus-tests/membarrier/membarrier-shared-rseq-ready.litmus
  create mode 100644 tools/testing/selftests/membarrier/membarrier_shared_rseq_test.c
 

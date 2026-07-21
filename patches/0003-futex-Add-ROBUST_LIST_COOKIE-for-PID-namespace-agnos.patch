@@ -1,4 +1,4 @@
-From 9602e0c3bb4a817ab53fe22d61a9b393aa4e5c6e Mon Sep 17 00:00:00 2001
+From 7d978d196578a80059806ed04db5c3dfb1562d98 Mon Sep 17 00:00:00 2001
 From: Keno Fischer <keno@juliahub.com>
 Date: Thu, 16 Jul 2026 08:19:53 +0000
 Subject: [PATCH 3/8] futex: Add ROBUST_LIST_COOKIE for PID namespace agnostic
@@ -329,7 +329,7 @@ index 10a36c551675..b64f024a0996 100644
   * Are there any waiters for this robust futex:
   */
 diff --git a/kernel/futex/core.c b/kernel/futex/core.c
-index e1a8772e4d48..1f431cc9fee6 100644
+index add8ade29e47..5e75bf92b7a7 100644
 --- a/kernel/futex/core.c
 +++ b/kernel/futex/core.c
 @@ -964,13 +964,21 @@ void futex_unqueue_pi(struct futex_q *q)
@@ -357,16 +357,16 @@ index e1a8772e4d48..1f431cc9fee6 100644
  	int err;
  
  	/* Futex address must be 32bit aligned */
-@@ -1025,7 +1033,7 @@ static int handle_futex_death(u32 __user *uaddr, struct task_struct *curr,
- 		return 0;
- 	}
+@@ -1027,7 +1035,7 @@ static int handle_futex_death(u32 __user *uaddr, struct task_struct *curr,
+ 	 */
+ 	owner = uval & FUTEX_TID_MASK;
  
 -	if (owner != task_pid_vnr(curr)) {
 +	if (owner != owner_id) {
- 		/*
- 		 * The dying task's pending op may have consumed the wake up
- 		 * notification of a robust unlock: woken, then killed before
-@@ -1121,6 +1129,28 @@ static inline int fetch_robust_entry(struct robust_list __user **entry,
+ 		if (pending_op && !pi &&
+ 		    (!owner || !(uval & FUTEX_WAITERS)))
+ 			futex_wake(uaddr, FLAGS_SIZE_32 | FLAGS_SHARED, NULL, 1,
+@@ -1106,6 +1114,28 @@ static inline int fetch_robust_entry(struct robust_list __user **entry,
  	return 0;
  }
  
@@ -395,7 +395,7 @@ index e1a8772e4d48..1f431cc9fee6 100644
  /*
   * Walk curr->futex.robust_list (very carefully, it's a userspace list!)
   * and mark any locks found there dead, and notify any waiters.
-@@ -1132,9 +1162,30 @@ static void exit_robust_list(struct task_struct *curr)
+@@ -1117,9 +1147,30 @@ static void exit_robust_list(struct task_struct *curr)
  	struct robust_list_head __user *head = curr->futex.robust_list;
  	unsigned int limit = ROBUST_LIST_LIMIT, cur_mod, next_mod, pend_mod;
  	struct robust_list __user *entry, *next_entry, *pending;
@@ -426,7 +426,7 @@ index e1a8772e4d48..1f431cc9fee6 100644
  	/*
  	 * Fetch the list head (which was registered earlier, via
  	 * sys_set_robust_list()):
-@@ -1153,20 +1204,70 @@ static void exit_robust_list(struct task_struct *curr)
+@@ -1138,20 +1189,70 @@ static void exit_robust_list(struct task_struct *curr)
  	if (fetch_robust_entry(&pending, &head->list_op_pending, &pend_mod))
  		return;
  
@@ -502,7 +502,7 @@ index e1a8772e4d48..1f431cc9fee6 100644
  				return;
  		}
  		if (rc)
-@@ -1182,9 +1283,10 @@ static void exit_robust_list(struct task_struct *curr)
+@@ -1167,9 +1268,10 @@ static void exit_robust_list(struct task_struct *curr)
  		cond_resched();
  	}
  
@@ -515,7 +515,7 @@ index e1a8772e4d48..1f431cc9fee6 100644
  	}
  }
  
-@@ -1219,6 +1321,23 @@ static void __user *futex_uaddr(struct robust_list __user *entry,
+@@ -1204,6 +1306,23 @@ static void __user *futex_uaddr(struct robust_list __user *entry,
  	return uaddr;
  }
  
@@ -539,7 +539,7 @@ index e1a8772e4d48..1f431cc9fee6 100644
  /*
   * Fetch a robust-list pointer. Bit 0 signals PI futexes:
   */
-@@ -1246,10 +1365,27 @@ static void compat_exit_robust_list(struct task_struct *curr)
+@@ -1231,10 +1350,27 @@ static void compat_exit_robust_list(struct task_struct *curr)
  	struct compat_robust_list_head __user *head = current->futex.compat_robust_list;
  	unsigned int limit = ROBUST_LIST_LIMIT, cur_mod, next_mod, pend_mod;
  	struct robust_list __user *entry, *next_entry, *pending;
@@ -568,7 +568,7 @@ index e1a8772e4d48..1f431cc9fee6 100644
  	/*
  	 * Fetch the list head (which was registered earlier, via
  	 * sys_set_robust_list()):
-@@ -1268,22 +1404,52 @@ static void compat_exit_robust_list(struct task_struct *curr)
+@@ -1253,22 +1389,52 @@ static void compat_exit_robust_list(struct task_struct *curr)
  	if (compat_fetch_robust_entry(&upending, &pending, &head->list_op_pending, &pend_mod))
  		return;
  
@@ -627,7 +627,7 @@ index e1a8772e4d48..1f431cc9fee6 100644
  				return;
  		}
  		if (rc)
-@@ -1299,10 +1465,11 @@ static void compat_exit_robust_list(struct task_struct *curr)
+@@ -1284,10 +1450,11 @@ static void compat_exit_robust_list(struct task_struct *curr)
  
  		cond_resched();
  	}
@@ -641,7 +641,7 @@ index e1a8772e4d48..1f431cc9fee6 100644
  	}
  }
  
-@@ -1441,6 +1608,7 @@ void __futex_fixup_robust_unlock(struct pt_regs *regs, struct futex_unlock_cs_ra
+@@ -1426,6 +1593,7 @@ void __futex_fixup_robust_unlock(struct pt_regs *regs, struct futex_unlock_cs_ra
  
  	futex_robust_list_clear_pending(pop, csr->pop_size32 ? FLAGS_ROBUST_LIST32 : 0);
  }
@@ -649,7 +649,7 @@ index e1a8772e4d48..1f431cc9fee6 100644
  #endif /* CONFIG_FUTEX_ROBUST_UNLOCK */
  
  static void futex_cleanup(struct task_struct *tsk)
-@@ -1448,12 +1616,14 @@ static void futex_cleanup(struct task_struct *tsk)
+@@ -1433,12 +1601,14 @@ static void futex_cleanup(struct task_struct *tsk)
  	if (unlikely(tsk->futex.robust_list)) {
  		exit_robust_list(tsk);
  		tsk->futex.robust_list = NULL;

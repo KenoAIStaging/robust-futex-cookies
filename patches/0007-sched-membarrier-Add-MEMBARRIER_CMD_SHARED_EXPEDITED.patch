@@ -1,4 +1,4 @@
-From 8f53ed1314e8eee7cb13350688dcbcbd9e809327 Mon Sep 17 00:00:00 2001
+From 4636c29941ff9dc5d6c89a62c183e8aa8e9ba86d Mon Sep 17 00:00:00 2001
 From: Keno Fischer <keno@juliahub.com>
 Date: Thu, 16 Jul 2026 08:22:52 +0000
 Subject: [PATCH 7/8] sched/membarrier: Add
