@@ -1,0 +1,158 @@
+From 63a507579abae77afd822e7738683eb5f4ca144f Mon Sep 17 00:00:00 2001
+From: Keno Fischer <keno@juliahub.com>
+To: Thomas Gleixner <tglx@kernel.org>,
+    Ingo Molnar <mingo@redhat.com>,
+    Peter Zijlstra <peterz@infradead.org>
+Cc: Darren Hart <dvhart@infradead.org>,
+    Davidlohr Bueso <dave@stgolabs.net>,
+    =?UTF-8?q?Andr=C3=A9=20Almeida?= <andrealmeid@igalia.com>,
+    linux-kernel@vger.kernel.org
+Date: Thu, 23 Jul 2026 02:33:27 +0000
+Subject: [PATCH 2/2] selftests/futex: Verify FUTEX_WAITERS retention across a
+ robust unlock
+
+Exercise the revised FUTEX_ROBUST_UNLOCK semantics: with two waiters
+queued on the futex, a robust unlock waking one waiter must store
+FUTEX_WAITERS into the futex word to keep subsequent acquisitions on the
+contended path; a robust unlock waking the last waiter must release the
+word to zero.
+
+The test blocks two children on the futex, confirms via /proc that both
+are queued, and checks the futex word and the pending op clearing after
+each of the two unlock operations.
+
+Signed-off-by: Keno Fischer <keno@juliahub.com>
+Assisted-by: ClaudeCode:claude-fable-5 tla+
+---
+ .../selftests/futex/functional/robust_list.c  | 110 ++++++++++++++++++
+ 1 file changed, 110 insertions(+)
+
+diff --git a/tools/testing/selftests/futex/functional/robust_list.c b/tools/testing/selftests/futex/functional/robust_list.c
+index b3fab60181d5..661bfbb8fabd 100644
+--- a/tools/testing/selftests/futex/functional/robust_list.c
++++ b/tools/testing/selftests/futex/functional/robust_list.c
+@@ -29,6 +29,7 @@
+ 
+ #include <dlfcn.h>
+ #include <errno.h>
++#include <fcntl.h>
+ #include <pthread.h>
+ #include <signal.h>
+ #include <stdint.h>
+@@ -788,4 +789,113 @@ TEST_F(futex_op, test_futex_robust_unlock)
+ 	ASSERT_EQ((uintptr_t)(unsigned long)head.list_op_pending, exp);
+ }
+ 
++/*
++ * A child which blocks on the lock: set FUTEX_WAITERS and wait. Returns 0
++ * when woken, nonzero on wait error (e.g. timeout).
++ */
++static int child_fn_wait_locked(void *arg)
++{
++	struct lock_struct *lock = arg;
++	_Atomic(unsigned int) *futex = &lock->futex;
++	struct timespec to = { .tv_sec = FUTEX_TIMEOUT, .tv_nsec = 0 };
++	unsigned int val;
++
++	val = atomic_load(futex) | FUTEX_WAITERS;
++	atomic_store(futex, val);
++
++	return futex_wait((futex_t *)futex, val, &to, 0) ? 1 : 0;
++}
++
++/*
++ * Whether the task is in interruptible sleep. The children of the test
++ * below do not sleep anywhere else, so this means queued in futex_wait().
++ */
++static bool task_sleeping(pid_t pid)
++{
++	char path[64], buf[256];
++	char *state;
++	ssize_t n;
++	int fd;
++
++	snprintf(path, sizeof(path), "/proc/%d/stat", pid);
++	fd = open(path, O_RDONLY);
++	if (fd < 0)
++		return false;
++	n = read(fd, buf, sizeof(buf) - 1);
++	close(fd);
++	if (n <= 0)
++		return false;
++	buf[n] = '\0';
++
++	/* The state field follows the comm's closing parenthesis */
++	state = strrchr(buf, ')');
++	if (!state || state[1] != ' ')
++		return false;
++
++	return state[2] == 'S';
++}
++
++/*
++ * The robust unlock must retain FUTEX_WAITERS in the futex word when
++ * waiters remain queued after the wakeup, so that acquisitions stay on the
++ * contended path and the next unlock wakes the next waiter, and release
++ * the word to zero once no waiter remains.
++ */
++TEST(test_futex_robust_unlock_retains_waiters)
++{
++#ifdef BUILD_64
++	const unsigned int op = FUTEX_UNLOCK_WAKE_LIST64;
++#else
++	const unsigned int op = FUTEX_UNLOCK_WAKE_LIST32;
++#endif
++	struct lock_struct lock = { .futex = 0 };
++	_Atomic(unsigned int) *futex = &lock.futex;
++	struct robust_list_head head;
++	int pid1, pid2, ret, wstatus;
++	pid_t tid = gettid();
++	int i;
++
++	ret = set_list(&head);
++	ASSERT_EQ(ret, 0);
++
++	/* Take the lock and arm the pending op for the unlock */
++	*futex = tid;
++	head.list_op_pending = &lock.list;
++
++	pid1 = create_child(&child_fn_wait_locked, &lock);
++	ASSERT_NE(pid1, -1);
++	pid2 = create_child(&child_fn_wait_locked, &lock);
++	ASSERT_NE(pid2, -1);
++
++	/* Wait until both children are queued on the futex */
++	for (i = 0; i < 20000; i++) {
++		if (task_sleeping(pid1) && task_sleeping(pid2))
++			break;
++		usleep(SLEEP_US);
++	}
++	ASSERT_TRUE(task_sleeping(pid1) && task_sleeping(pid2));
++
++	/* Wake one waiter: the remaining one must be kept in the word */
++	ret = sys_futex_robust_unlock(futex, op, 1,
++				      &head.list_op_pending, 0);
++	ASSERT_EQ(ret, 1);
++	ASSERT_EQ(atomic_load(futex), FUTEX_WAITERS);
++	ASSERT_EQ((uintptr_t)(unsigned long)head.list_op_pending,
++		  (uintptr_t)NULL);
++
++	/* Wake the last waiter: the word must be released to zero */
++	head.list_op_pending = &lock.list;
++	ret = sys_futex_robust_unlock(futex, op, 1,
++				      &head.list_op_pending, 0);
++	ASSERT_EQ(ret, 1);
++	ASSERT_EQ(atomic_load(futex), 0);
++
++	waitpid(pid1, &wstatus, 0);
++	ASSERT_EQ(WEXITSTATUS(wstatus), 0);
++	waitpid(pid2, &wstatus, 0);
++	ASSERT_EQ(WEXITSTATUS(wstatus), 0);
++
++	ksft_test_result_pass("%s\n", __func__);
++}
++
+ TEST_HARNESS_MAIN
+-- 
+2.54.0
+

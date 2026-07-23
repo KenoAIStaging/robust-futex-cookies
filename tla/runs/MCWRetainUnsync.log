@@ -1,0 +1,474 @@
+TLC2 Version 2026.07.15.134331 (rev: 227f61b)
+Running breadth-first search Model-Checking with fp 107 and seed 1922293031723231396 with 8 workers on 128 cores with 27305MB heap and 64MB offheap memory [pid: 8823] (Linux 6.8.0-134-generic amd64, Debian 11.0.24 64bit, MSBDiskFPSet, DiskStateQueue).
+Parsing file /workspace/robust-futex-work/tla/MCWRetainUnsync.tla
+Parsing file /workspace/robust-futex-work/tla/WaitersRetain.tla
+Parsing file /tmp/tlc-14763852166256522797/_TLCTrace.tla (jar:file:/workspace/robust-futex-work/tla/tla2tools.jar!/tla2sany/StandardModules/_TLCTrace.tla)
+Parsing file /tmp/tlc-14763852166256522797/Naturals.tla (jar:file:/workspace/robust-futex-work/tla/tla2tools.jar!/tla2sany/StandardModules/Naturals.tla)
+Parsing file /tmp/tlc-14763852166256522797/Sequences.tla (jar:file:/workspace/robust-futex-work/tla/tla2tools.jar!/tla2sany/StandardModules/Sequences.tla)
+Parsing file /tmp/tlc-14763852166256522797/FiniteSets.tla (jar:file:/workspace/robust-futex-work/tla/tla2tools.jar!/tla2sany/StandardModules/FiniteSets.tla)
+Parsing file /tmp/tlc-14763852166256522797/TLC.tla (jar:file:/workspace/robust-futex-work/tla/tla2tools.jar!/tla2sany/StandardModules/TLC.tla)
+Parsing file /tmp/tlc-14763852166256522797/TLCExt.tla (jar:file:/workspace/robust-futex-work/tla/tla2tools.jar!/tla2sany/StandardModules/TLCExt.tla)
+Parsing file /tmp/tlc-14763852166256522797/Integers.tla (jar:file:/workspace/robust-futex-work/tla/tla2tools.jar!/tla2sany/StandardModules/Integers.tla)
+Semantic processing of module Naturals
+Semantic processing of module Sequences
+Semantic processing of module FiniteSets
+Semantic processing of module WaitersRetain
+Semantic processing of module TLC
+Semantic processing of module Integers
+Semantic processing of module TLCExt
+Semantic processing of module _TLCTrace
+Semantic processing of module MCWRetainUnsync
+Linting of module WaitersRetain
+Linting of module TLCExt
+Linting of module _TLCTrace
+Linting of module MCWRetainUnsync
+Starting... (2026-07-23 02:27:13)
+Implied-temporal checking--satisfiability problem has 3 branches.
+Computing initial states...
+Finished computing initial states: 1 distinct state generated at 2026-07-23 02:27:13.
+Checking 3 branches of temporal properties for the current state space with 117396 total distinct states at (2026-07-23 02:27:16)
+Finished checking temporal properties in 00s at 2026-07-23 02:27:17
+Progress(17) at 2026-07-23 02:27:17: 101,530 states generated (101,530 s/min), 39,132 distinct states found (39,132 ds/min), 13,766 states left on queue.
+Checking 3 branches of temporal properties for the current state space with 4897722 total distinct states at (2026-07-23 02:28:17)
+Error: Temporal property WaiterServed was violated.
+
+Error: The following behavior constitutes a counter-example:
+
+State 1: <Initial predicate>
+/\ done_e = <<FALSE, FALSE, FALSE>>
+/\ done_p = <<FALSE, FALSE, FALSE>>
+/\ word = [own |-> 0, od |-> FALSE, wtr |-> FALSE]
+/\ alive = <<TRUE, TRUE, TRUE>>
+/\ q = <<>>
+/\ pc = <<"idle", "idle", "idle">>
+/\ waited = <<FALSE, FALSE, FALSE>>
+/\ pending = <<FALSE, FALSE, FALSE>>
+/\ assume_w = <<FALSE, FALSE, FALSE>>
+/\ srem = <<FALSE, FALSE, FALSE>>
+/\ expw = << [own |-> 0, od |-> FALSE, wtr |-> FALSE],
+   [own |-> 0, od |-> FALSE, wtr |-> FALSE],
+   [own |-> 0, od |-> FALSE, wtr |-> FALSE] >>
+/\ enq = <<FALSE, FALSE, FALSE>>
+
+State 2: <StartAcq(2) line 118, col 5 to line 123, col 68 of module WaitersRetain>
+/\ done_e = <<FALSE, FALSE, FALSE>>
+/\ done_p = <<FALSE, FALSE, FALSE>>
+/\ word = [own |-> 0, od |-> FALSE, wtr |-> FALSE]
+/\ alive = <<TRUE, TRUE, TRUE>>
+/\ q = <<>>
+/\ pc = <<"idle", "acq", "idle">>
+/\ waited = <<FALSE, FALSE, FALSE>>
+/\ pending = <<FALSE, TRUE, FALSE>>
+/\ assume_w = <<FALSE, FALSE, FALSE>>
+/\ srem = <<FALSE, FALSE, FALSE>>
+/\ expw = << [own |-> 0, od |-> FALSE, wtr |-> FALSE],
+   [own |-> 0, od |-> FALSE, wtr |-> FALSE],
+   [own |-> 0, od |-> FALSE, wtr |-> FALSE] >>
+/\ enq = <<FALSE, FALSE, FALSE>>
+
+State 3: <StartAcq(1) line 118, col 5 to line 123, col 68 of module WaitersRetain>
+/\ done_e = <<FALSE, FALSE, FALSE>>
+/\ done_p = <<FALSE, FALSE, FALSE>>
+/\ word = [own |-> 0, od |-> FALSE, wtr |-> FALSE]
+/\ alive = <<TRUE, TRUE, TRUE>>
+/\ q = <<>>
+/\ pc = <<"acq", "acq", "idle">>
+/\ waited = <<FALSE, FALSE, FALSE>>
+/\ pending = <<TRUE, TRUE, FALSE>>
+/\ assume_w = <<FALSE, FALSE, FALSE>>
+/\ srem = <<FALSE, FALSE, FALSE>>
+/\ expw = << [own |-> 0, od |-> FALSE, wtr |-> FALSE],
+   [own |-> 0, od |-> FALSE, wtr |-> FALSE],
+   [own |-> 0, od |-> FALSE, wtr |-> FALSE] >>
+/\ enq = <<FALSE, FALSE, FALSE>>
+
+State 4: <StartAcq(3) line 118, col 5 to line 123, col 68 of module WaitersRetain>
+/\ done_e = <<FALSE, FALSE, FALSE>>
+/\ done_p = <<FALSE, FALSE, FALSE>>
+/\ word = [own |-> 0, od |-> FALSE, wtr |-> FALSE]
+/\ alive = <<TRUE, TRUE, TRUE>>
+/\ q = <<>>
+/\ pc = <<"acq", "acq", "acq">>
+/\ waited = <<FALSE, FALSE, FALSE>>
+/\ pending = <<TRUE, TRUE, TRUE>>
+/\ assume_w = <<FALSE, FALSE, FALSE>>
+/\ srem = <<FALSE, FALSE, FALSE>>
+/\ expw = << [own |-> 0, od |-> FALSE, wtr |-> FALSE],
+   [own |-> 0, od |-> FALSE, wtr |-> FALSE],
+   [own |-> 0, od |-> FALSE, wtr |-> FALSE] >>
+/\ enq = <<FALSE, FALSE, FALSE>>
+
+State 5: <TryAcquire(3) line 130, col 5 to line 136, col 35 of module WaitersRetain>
+/\ done_e = <<FALSE, FALSE, FALSE>>
+/\ done_p = <<FALSE, FALSE, FALSE>>
+/\ word = [own |-> 3, od |-> FALSE, wtr |-> FALSE]
+/\ alive = <<TRUE, TRUE, TRUE>>
+/\ q = <<>>
+/\ pc = <<"acq", "acq", "acquired">>
+/\ waited = <<FALSE, FALSE, FALSE>>
+/\ pending = <<TRUE, TRUE, TRUE>>
+/\ assume_w = <<FALSE, FALSE, FALSE>>
+/\ srem = <<FALSE, FALSE, FALSE>>
+/\ expw = << [own |-> 0, od |-> FALSE, wtr |-> FALSE],
+   [own |-> 0, od |-> FALSE, wtr |-> FALSE],
+   [own |-> 0, od |-> FALSE, wtr |-> FALSE] >>
+/\ enq = <<FALSE, FALSE, FALSE>>
+
+State 6: <SetWtr(2) line 151, col 5 to line 157, col 73 of module WaitersRetain>
+/\ done_e = <<FALSE, FALSE, FALSE>>
+/\ done_p = <<FALSE, FALSE, FALSE>>
+/\ word = [own |-> 3, od |-> FALSE, wtr |-> TRUE]
+/\ alive = <<TRUE, TRUE, TRUE>>
+/\ q = <<>>
+/\ pc = <<"acq", "waitpre", "acquired">>
+/\ waited = <<FALSE, FALSE, FALSE>>
+/\ pending = <<TRUE, TRUE, TRUE>>
+/\ assume_w = <<FALSE, TRUE, FALSE>>
+/\ srem = <<FALSE, FALSE, FALSE>>
+/\ expw = << [own |-> 0, od |-> FALSE, wtr |-> FALSE],
+   [own |-> 3, od |-> FALSE, wtr |-> TRUE],
+   [own |-> 0, od |-> FALSE, wtr |-> FALSE] >>
+/\ enq = <<FALSE, FALSE, FALSE>>
+
+State 7: <FutexWait(2) line 173, col 5 to line 182, col 27 of module WaitersRetain>
+/\ done_e = <<FALSE, FALSE, FALSE>>
+/\ done_p = <<FALSE, FALSE, FALSE>>
+/\ word = [own |-> 3, od |-> FALSE, wtr |-> TRUE]
+/\ alive = <<TRUE, TRUE, TRUE>>
+/\ q = <<2>>
+/\ pc = <<"acq", "sleeping", "acquired">>
+/\ waited = <<FALSE, TRUE, FALSE>>
+/\ pending = <<TRUE, TRUE, TRUE>>
+/\ assume_w = <<FALSE, TRUE, FALSE>>
+/\ srem = <<FALSE, FALSE, FALSE>>
+/\ expw = << [own |-> 0, od |-> FALSE, wtr |-> FALSE],
+   [own |-> 3, od |-> FALSE, wtr |-> TRUE],
+   [own |-> 0, od |-> FALSE, wtr |-> FALSE] >>
+/\ enq = <<FALSE, FALSE, FALSE>>
+
+State 8: <SnapWait(1) line 161, col 5 to line 167, col 27 of module WaitersRetain>
+/\ done_e = <<FALSE, FALSE, FALSE>>
+/\ done_p = <<FALSE, FALSE, FALSE>>
+/\ word = [own |-> 3, od |-> FALSE, wtr |-> TRUE]
+/\ alive = <<TRUE, TRUE, TRUE>>
+/\ q = <<2>>
+/\ pc = <<"waitpre", "sleeping", "acquired">>
+/\ waited = <<FALSE, TRUE, FALSE>>
+/\ pending = <<TRUE, TRUE, TRUE>>
+/\ assume_w = <<TRUE, TRUE, FALSE>>
+/\ srem = <<FALSE, FALSE, FALSE>>
+/\ expw = << [own |-> 3, od |-> FALSE, wtr |-> TRUE],
+   [own |-> 3, od |-> FALSE, wtr |-> TRUE],
+   [own |-> 0, od |-> FALSE, wtr |-> FALSE] >>
+/\ enq = <<FALSE, FALSE, FALSE>>
+
+State 9: <Enqueue(3) line 186, col 5 to line 190, col 35 of module WaitersRetain>
+/\ done_e = <<FALSE, FALSE, FALSE>>
+/\ done_p = <<FALSE, FALSE, FALSE>>
+/\ word = [own |-> 3, od |-> FALSE, wtr |-> TRUE]
+/\ alive = <<TRUE, TRUE, TRUE>>
+/\ q = <<2>>
+/\ pc = <<"waitpre", "sleeping", "enqueued">>
+/\ waited = <<FALSE, TRUE, FALSE>>
+/\ pending = <<TRUE, TRUE, TRUE>>
+/\ assume_w = <<TRUE, TRUE, FALSE>>
+/\ srem = <<FALSE, FALSE, FALSE>>
+/\ expw = << [own |-> 3, od |-> FALSE, wtr |-> TRUE],
+   [own |-> 3, od |-> FALSE, wtr |-> TRUE],
+   [own |-> 0, od |-> FALSE, wtr |-> FALSE] >>
+/\ enq = <<FALSE, FALSE, TRUE>>
+
+State 10: <DisarmAcq(3) line 193, col 5 to line 197, col 35 of module WaitersRetain>
+/\ done_e = <<FALSE, FALSE, FALSE>>
+/\ done_p = <<FALSE, FALSE, FALSE>>
+/\ word = [own |-> 3, od |-> FALSE, wtr |-> TRUE]
+/\ alive = <<TRUE, TRUE, TRUE>>
+/\ q = <<2>>
+/\ pc = <<"waitpre", "sleeping", "own">>
+/\ waited = <<FALSE, TRUE, FALSE>>
+/\ pending = <<TRUE, TRUE, FALSE>>
+/\ assume_w = <<TRUE, TRUE, FALSE>>
+/\ srem = <<FALSE, FALSE, FALSE>>
+/\ expw = << [own |-> 3, od |-> FALSE, wtr |-> TRUE],
+   [own |-> 3, od |-> FALSE, wtr |-> TRUE],
+   [own |-> 0, od |-> FALSE, wtr |-> FALSE] >>
+/\ enq = <<FALSE, FALSE, TRUE>>
+
+State 11: <StartRel(3) line 205, col 5 to line 210, col 27 of module WaitersRetain>
+/\ done_e = <<FALSE, FALSE, FALSE>>
+/\ done_p = <<FALSE, FALSE, FALSE>>
+/\ word = [own |-> 3, od |-> FALSE, wtr |-> TRUE]
+/\ alive = <<TRUE, TRUE, TRUE>>
+/\ q = <<2>>
+/\ pc = <<"waitpre", "sleeping", "rel">>
+/\ waited = <<FALSE, TRUE, FALSE>>
+/\ pending = <<TRUE, TRUE, TRUE>>
+/\ assume_w = <<TRUE, TRUE, FALSE>>
+/\ srem = <<FALSE, FALSE, FALSE>>
+/\ expw = << [own |-> 3, od |-> FALSE, wtr |-> TRUE],
+   [own |-> 3, od |-> FALSE, wtr |-> TRUE],
+   [own |-> 0, od |-> FALSE, wtr |-> FALSE] >>
+/\ enq = <<FALSE, FALSE, FALSE>>
+
+State 12: <VdsoTry(3) line 215, col 5 to line 223, col 35 of module WaitersRetain>
+/\ done_e = <<FALSE, FALSE, FALSE>>
+/\ done_p = <<FALSE, FALSE, FALSE>>
+/\ word = [own |-> 3, od |-> FALSE, wtr |-> TRUE]
+/\ alive = <<TRUE, TRUE, TRUE>>
+/\ q = <<2>>
+/\ pc = <<"waitpre", "sleeping", "relscan">>
+/\ waited = <<FALSE, TRUE, FALSE>>
+/\ pending = <<TRUE, TRUE, TRUE>>
+/\ assume_w = <<TRUE, TRUE, FALSE>>
+/\ srem = <<FALSE, FALSE, FALSE>>
+/\ expw = << [own |-> 3, od |-> FALSE, wtr |-> TRUE],
+   [own |-> 3, od |-> FALSE, wtr |-> TRUE],
+   [own |-> 0, od |-> FALSE, wtr |-> FALSE] >>
+/\ enq = <<FALSE, FALSE, FALSE>>
+
+State 13: <RelScan(3) line 247, col 5 to line 252, col 35 of module WaitersRetain>
+/\ done_e = <<FALSE, FALSE, FALSE>>
+/\ done_p = <<FALSE, FALSE, FALSE>>
+/\ word = [own |-> 3, od |-> FALSE, wtr |-> TRUE]
+/\ alive = <<TRUE, TRUE, TRUE>>
+/\ q = <<2>>
+/\ pc = <<"waitpre", "sleeping", "relstore">>
+/\ waited = <<FALSE, TRUE, FALSE>>
+/\ pending = <<TRUE, TRUE, TRUE>>
+/\ assume_w = <<TRUE, TRUE, FALSE>>
+/\ srem = <<FALSE, FALSE, FALSE>>
+/\ expw = << [own |-> 3, od |-> FALSE, wtr |-> TRUE],
+   [own |-> 3, od |-> FALSE, wtr |-> TRUE],
+   [own |-> 0, od |-> FALSE, wtr |-> FALSE] >>
+/\ enq = <<FALSE, FALSE, FALSE>>
+
+State 14: <FutexWait(1) line 173, col 5 to line 182, col 27 of module WaitersRetain>
+/\ done_e = <<FALSE, FALSE, FALSE>>
+/\ done_p = <<FALSE, FALSE, FALSE>>
+/\ word = [own |-> 3, od |-> FALSE, wtr |-> TRUE]
+/\ alive = <<TRUE, TRUE, TRUE>>
+/\ q = <<2, 1>>
+/\ pc = <<"sleeping", "sleeping", "relstore">>
+/\ waited = <<TRUE, TRUE, FALSE>>
+/\ pending = <<TRUE, TRUE, TRUE>>
+/\ assume_w = <<TRUE, TRUE, FALSE>>
+/\ srem = <<FALSE, FALSE, FALSE>>
+/\ expw = << [own |-> 3, od |-> FALSE, wtr |-> TRUE],
+   [own |-> 3, od |-> FALSE, wtr |-> TRUE],
+   [own |-> 0, od |-> FALSE, wtr |-> FALSE] >>
+/\ enq = <<FALSE, FALSE, FALSE>>
+
+State 15: <RelStore(3) line 255, col 5 to line 260, col 35 of module WaitersRetain>
+/\ done_e = <<FALSE, FALSE, FALSE>>
+/\ done_p = <<FALSE, FALSE, FALSE>>
+/\ word = [own |-> 0, od |-> FALSE, wtr |-> FALSE]
+/\ alive = <<TRUE, TRUE, TRUE>>
+/\ q = <<2, 1>>
+/\ pc = <<"sleeping", "sleeping", "relwake">>
+/\ waited = <<TRUE, TRUE, FALSE>>
+/\ pending = <<TRUE, TRUE, TRUE>>
+/\ assume_w = <<TRUE, TRUE, FALSE>>
+/\ srem = <<FALSE, FALSE, FALSE>>
+/\ expw = << [own |-> 3, od |-> FALSE, wtr |-> TRUE],
+   [own |-> 3, od |-> FALSE, wtr |-> TRUE],
+   [own |-> 0, od |-> FALSE, wtr |-> FALSE] >>
+/\ enq = <<FALSE, FALSE, FALSE>>
+
+State 16: <RelWake(3) line 263, col 5 to line 271, col 35 of module WaitersRetain>
+/\ done_e = <<FALSE, FALSE, FALSE>>
+/\ done_p = <<FALSE, FALSE, FALSE>>
+/\ word = [own |-> 0, od |-> FALSE, wtr |-> FALSE]
+/\ alive = <<TRUE, TRUE, TRUE>>
+/\ q = <<1>>
+/\ pc = <<"sleeping", "acq", "unlocked">>
+/\ waited = <<TRUE, TRUE, FALSE>>
+/\ pending = <<TRUE, TRUE, TRUE>>
+/\ assume_w = <<TRUE, TRUE, FALSE>>
+/\ srem = <<FALSE, FALSE, FALSE>>
+/\ expw = << [own |-> 3, od |-> FALSE, wtr |-> TRUE],
+   [own |-> 3, od |-> FALSE, wtr |-> TRUE],
+   [own |-> 0, od |-> FALSE, wtr |-> FALSE] >>
+/\ enq = <<FALSE, FALSE, FALSE>>
+
+State 17: <Die(2) line 292, col 5 to line 297, col 35 of module WaitersRetain>
+/\ done_e = <<FALSE, FALSE, FALSE>>
+/\ done_p = <<FALSE, FALSE, FALSE>>
+/\ word = [own |-> 0, od |-> FALSE, wtr |-> FALSE]
+/\ alive = <<TRUE, FALSE, TRUE>>
+/\ q = <<1>>
+/\ pc = <<"sleeping", "acq", "unlocked">>
+/\ waited = <<TRUE, TRUE, FALSE>>
+/\ pending = <<TRUE, TRUE, TRUE>>
+/\ assume_w = <<TRUE, TRUE, FALSE>>
+/\ srem = <<FALSE, FALSE, FALSE>>
+/\ expw = << [own |-> 3, od |-> FALSE, wtr |-> TRUE],
+   [own |-> 3, od |-> FALSE, wtr |-> TRUE],
+   [own |-> 0, od |-> FALSE, wtr |-> FALSE] >>
+/\ enq = <<FALSE, FALSE, FALSE>>
+
+State 18: <CleanupEntry(2) line 302, col 5 to line 313, col 27 of module WaitersRetain>
+/\ done_e = <<FALSE, TRUE, FALSE>>
+/\ done_p = <<FALSE, FALSE, FALSE>>
+/\ word = [own |-> 0, od |-> FALSE, wtr |-> FALSE]
+/\ alive = <<TRUE, FALSE, TRUE>>
+/\ q = <<1>>
+/\ pc = <<"sleeping", "acq", "unlocked">>
+/\ waited = <<TRUE, TRUE, FALSE>>
+/\ pending = <<TRUE, TRUE, TRUE>>
+/\ assume_w = <<TRUE, TRUE, FALSE>>
+/\ srem = <<FALSE, FALSE, FALSE>>
+/\ expw = << [own |-> 3, od |-> FALSE, wtr |-> TRUE],
+   [own |-> 3, od |-> FALSE, wtr |-> TRUE],
+   [own |-> 0, od |-> FALSE, wtr |-> FALSE] >>
+/\ enq = <<FALSE, FALSE, FALSE>>
+
+State 19: <FinishRel(3) line 275, col 5 to line 279, col 35 of module WaitersRetain>
+/\ done_e = <<FALSE, TRUE, FALSE>>
+/\ done_p = <<FALSE, FALSE, FALSE>>
+/\ word = [own |-> 0, od |-> FALSE, wtr |-> FALSE]
+/\ alive = <<TRUE, FALSE, TRUE>>
+/\ q = <<1>>
+/\ pc = <<"sleeping", "acq", "idle">>
+/\ waited = <<TRUE, TRUE, FALSE>>
+/\ pending = <<TRUE, TRUE, FALSE>>
+/\ assume_w = <<TRUE, TRUE, FALSE>>
+/\ srem = <<FALSE, FALSE, FALSE>>
+/\ expw = << [own |-> 3, od |-> FALSE, wtr |-> TRUE],
+   [own |-> 3, od |-> FALSE, wtr |-> TRUE],
+   [own |-> 0, od |-> FALSE, wtr |-> FALSE] >>
+/\ enq = <<FALSE, FALSE, FALSE>>
+
+State 20: <StartAcq(3) line 118, col 5 to line 123, col 68 of module WaitersRetain>
+/\ done_e = <<FALSE, TRUE, FALSE>>
+/\ done_p = <<FALSE, FALSE, FALSE>>
+/\ word = [own |-> 0, od |-> FALSE, wtr |-> FALSE]
+/\ alive = <<TRUE, FALSE, TRUE>>
+/\ q = <<1>>
+/\ pc = <<"sleeping", "acq", "acq">>
+/\ waited = <<TRUE, TRUE, FALSE>>
+/\ pending = <<TRUE, TRUE, TRUE>>
+/\ assume_w = <<TRUE, TRUE, FALSE>>
+/\ srem = <<FALSE, FALSE, FALSE>>
+/\ expw = << [own |-> 3, od |-> FALSE, wtr |-> TRUE],
+   [own |-> 3, od |-> FALSE, wtr |-> TRUE],
+   [own |-> 0, od |-> FALSE, wtr |-> FALSE] >>
+/\ enq = <<FALSE, FALSE, FALSE>>
+
+State 21: <TryAcquire(3) line 130, col 5 to line 136, col 35 of module WaitersRetain>
+/\ done_e = <<FALSE, TRUE, FALSE>>
+/\ done_p = <<FALSE, FALSE, FALSE>>
+/\ word = [own |-> 3, od |-> FALSE, wtr |-> FALSE]
+/\ alive = <<TRUE, FALSE, TRUE>>
+/\ q = <<1>>
+/\ pc = <<"sleeping", "acq", "acquired">>
+/\ waited = <<TRUE, TRUE, FALSE>>
+/\ pending = <<TRUE, TRUE, TRUE>>
+/\ assume_w = <<TRUE, TRUE, FALSE>>
+/\ srem = <<FALSE, FALSE, FALSE>>
+/\ expw = << [own |-> 3, od |-> FALSE, wtr |-> TRUE],
+   [own |-> 3, od |-> FALSE, wtr |-> TRUE],
+   [own |-> 0, od |-> FALSE, wtr |-> FALSE] >>
+/\ enq = <<FALSE, FALSE, FALSE>>
+
+State 22: <CleanupPending(2) line 321, col 5 to line 339, col 27 of module WaitersRetain>
+/\ done_e = <<FALSE, TRUE, FALSE>>
+/\ done_p = <<FALSE, TRUE, FALSE>>
+/\ word = [own |-> 3, od |-> FALSE, wtr |-> FALSE]
+/\ alive = <<TRUE, FALSE, TRUE>>
+/\ q = <<1>>
+/\ pc = <<"sleeping", "acq", "acquired">>
+/\ waited = <<TRUE, TRUE, FALSE>>
+/\ pending = <<TRUE, TRUE, TRUE>>
+/\ assume_w = <<TRUE, TRUE, FALSE>>
+/\ srem = <<FALSE, FALSE, FALSE>>
+/\ expw = << [own |-> 3, od |-> FALSE, wtr |-> TRUE],
+   [own |-> 3, od |-> FALSE, wtr |-> TRUE],
+   [own |-> 0, od |-> FALSE, wtr |-> FALSE] >>
+/\ enq = <<FALSE, FALSE, FALSE>>
+
+State 23: <Reincarnate(2) line 343, col 5 to line 354, col 28 of module WaitersRetain>
+/\ done_e = <<FALSE, FALSE, FALSE>>
+/\ done_p = <<FALSE, FALSE, FALSE>>
+/\ word = [own |-> 3, od |-> FALSE, wtr |-> FALSE]
+/\ alive = <<TRUE, TRUE, TRUE>>
+/\ q = <<1>>
+/\ pc = <<"sleeping", "idle", "acquired">>
+/\ waited = <<TRUE, FALSE, FALSE>>
+/\ pending = <<TRUE, FALSE, TRUE>>
+/\ assume_w = <<TRUE, FALSE, FALSE>>
+/\ srem = <<FALSE, FALSE, FALSE>>
+/\ expw = << [own |-> 3, od |-> FALSE, wtr |-> TRUE],
+   [own |-> 0, od |-> FALSE, wtr |-> FALSE],
+   [own |-> 0, od |-> FALSE, wtr |-> FALSE] >>
+/\ enq = <<FALSE, FALSE, FALSE>>
+
+State 24: <Die(3) line 292, col 5 to line 297, col 35 of module WaitersRetain>
+/\ done_e = <<FALSE, FALSE, FALSE>>
+/\ done_p = <<FALSE, FALSE, FALSE>>
+/\ word = [own |-> 3, od |-> FALSE, wtr |-> FALSE]
+/\ alive = <<TRUE, TRUE, FALSE>>
+/\ q = <<1>>
+/\ pc = <<"sleeping", "idle", "acquired">>
+/\ waited = <<TRUE, FALSE, FALSE>>
+/\ pending = <<TRUE, FALSE, TRUE>>
+/\ assume_w = <<TRUE, FALSE, FALSE>>
+/\ srem = <<FALSE, FALSE, FALSE>>
+/\ expw = << [own |-> 3, od |-> FALSE, wtr |-> TRUE],
+   [own |-> 0, od |-> FALSE, wtr |-> FALSE],
+   [own |-> 0, od |-> FALSE, wtr |-> FALSE] >>
+/\ enq = <<FALSE, FALSE, FALSE>>
+
+State 25: <CleanupEntry(3) line 302, col 5 to line 313, col 27 of module WaitersRetain>
+/\ done_e = <<FALSE, FALSE, TRUE>>
+/\ done_p = <<FALSE, FALSE, FALSE>>
+/\ word = [own |-> 3, od |-> FALSE, wtr |-> FALSE]
+/\ alive = <<TRUE, TRUE, FALSE>>
+/\ q = <<1>>
+/\ pc = <<"sleeping", "idle", "acquired">>
+/\ waited = <<TRUE, FALSE, FALSE>>
+/\ pending = <<TRUE, FALSE, TRUE>>
+/\ assume_w = <<TRUE, FALSE, FALSE>>
+/\ srem = <<FALSE, FALSE, FALSE>>
+/\ expw = << [own |-> 3, od |-> FALSE, wtr |-> TRUE],
+   [own |-> 0, od |-> FALSE, wtr |-> FALSE],
+   [own |-> 0, od |-> FALSE, wtr |-> FALSE] >>
+/\ enq = <<FALSE, FALSE, FALSE>>
+
+State 26: <CleanupPending(3) line 321, col 5 to line 339, col 27 of module WaitersRetain>
+/\ done_e = <<FALSE, FALSE, TRUE>>
+/\ done_p = <<FALSE, FALSE, TRUE>>
+/\ word = [own |-> 0, od |-> TRUE, wtr |-> FALSE]
+/\ alive = <<TRUE, TRUE, FALSE>>
+/\ q = <<1>>
+/\ pc = <<"sleeping", "idle", "acquired">>
+/\ waited = <<TRUE, FALSE, FALSE>>
+/\ pending = <<TRUE, FALSE, TRUE>>
+/\ assume_w = <<TRUE, FALSE, FALSE>>
+/\ srem = <<FALSE, FALSE, FALSE>>
+/\ expw = << [own |-> 3, od |-> FALSE, wtr |-> TRUE],
+   [own |-> 0, od |-> FALSE, wtr |-> FALSE],
+   [own |-> 0, od |-> FALSE, wtr |-> FALSE] >>
+/\ enq = <<FALSE, FALSE, FALSE>>
+
+State 27: <Reincarnate(3) line 343, col 5 to line 354, col 28 of module WaitersRetain>
+/\ done_e = <<FALSE, FALSE, FALSE>>
+/\ done_p = <<FALSE, FALSE, FALSE>>
+/\ word = [own |-> 0, od |-> TRUE, wtr |-> FALSE]
+/\ alive = <<TRUE, TRUE, TRUE>>
+/\ q = <<1>>
+/\ pc = <<"sleeping", "idle", "idle">>
+/\ waited = <<TRUE, FALSE, FALSE>>
+/\ pending = <<TRUE, FALSE, FALSE>>
+/\ assume_w = <<TRUE, FALSE, FALSE>>
+/\ srem = <<FALSE, FALSE, FALSE>>
+/\ expw = << [own |-> 3, od |-> FALSE, wtr |-> TRUE],
+   [own |-> 0, od |-> FALSE, wtr |-> FALSE],
+   [own |-> 0, od |-> FALSE, wtr |-> FALSE] >>
+/\ enq = <<FALSE, FALSE, FALSE>>
+
+State 28: Stuttering
+Finished checking temporal properties in 12s at 2026-07-23 02:28:29
+4960659 states generated, 1632574 distinct states found, 311537 states left on queue.
+The depth of the complete state graph search is 29.
+Finished in 01min 16s at (2026-07-23 02:28:29)
+Trace exploration spec path: ./MCWRetainUnsync_TTrace_1784773633.tla

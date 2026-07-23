@@ -31,6 +31,21 @@ analogue of the 30-bit space with the generation in bit 29).
   generation gate, the exit time pending op fixups, plus everything
   from the explicit model.
 
+- `WaitersRetain.tla` — the mainline (no cookies, single namespace)
+  `FUTEX_ROBUST_UNLOCK` protocol with the revised kernel unlock
+  semantics: the release store writes `FUTEX_WAITERS` instead of 0
+  when waiters remain queued after the wakeup, so the wakeup chain
+  lives in the futex word rather than in the woken (killable) waiter.
+  Unlike the explicit model it carries the kernel hash bucket queue
+  explicitly and models `futex_wait()` as snapshot-then-atomically
+  revalidate-and-enqueue (the hash bucket lock atomicity), which is
+  the granularity needed to show the release store must be serialized
+  with waiter enqueueing. Switches select the retention
+  (`RetainWaiters`), whether count/store/wake happen in one hash
+  bucket lock section (`SyncStore`), and `handle_futex_death()`'s
+  existing pending-op wake for an ownerless word
+  (`ExitWakeOwnerZero`).
+
 Ghost state (`owner`, `corrupt`) tracks true ownership so the two key
 safety properties are directly checkable:
 
@@ -63,6 +78,10 @@ artifact provenance).
 |-----------------------|---------------------------------------------------|--------|
 | MCExplicitOK          | final ABI + fixed walk order (pending first) + lease-last list order + cleanup wake + WAITERS re-assertion; 3 threads, 3 leased cookies, waiters modeled | PASS, exhaustive, deadlock checking on: TypeOK/NoCorruption/Exclusion + Recovery + NoLostWakeup; 114.9M generated / 33.5M distinct (with the WAITERS-guarded mismatch replay) |
 | MCExplicitNoWake      | as OK but the exit cleanup never wakes             | NoLostWakeup **violated** (sleeping waiters never woken after owner death) |
+| MCWRetainOK           | retained-WAITERS robust unlock (mainline, no cookies), count+store+wake in one hb-lock section, existing owner-zero pending wake; 3 threads, explicit kernel queue | PASS, exhaustive, deadlock checking on: TypeOK/QOK/Exclusion/WtrInv + WaiterServed (every sleeper eventually woken or dead); 32.9M generated / 9.2M distinct |
+| MCWRetainNoRetain     | as MCWRetainOK but the unlock stores 0 (current mainline semantics) | WaiterServed **violated** (the lost wakeup: woken waiter killed, fast-path re-acquirer's vDSO unlock strands the remaining sleeper) |
+| MCWRetainUnsync       | as MCWRetainOK but remaining-count / store / wake as separate steps (store not under the hb lock) | WaiterServed **violated** (a waiter enqueues between count and store - its revalidation still matches - and is stranded uncounted) |
+| MCWRetainNoExitWake   | as MCWRetainOK but handle_futex_death()'s owner-zero pending wake disabled | WaiterServed **violated** (woken waiter dies on the released word; retention alone cannot replay its consumed wakeup) |
 | MCExplicitLostWaiter  | as OK but woken acquirers do not re-assert WAITERS | NoLostWakeup **violated** (the lost waiter bug: kernel unlock wiped the bit, the woken waiter's fast-path unlock strands the rest) |
 | MCExplicitLeaseABA    | as OK but historical walk order (entries, then pending) | NoCorruption **violated** (lease released before the stale pending op: issue #1) |
 | MCExplicitLeaseOrder  | as OK but the lease slot walked before held locks | NoCorruption **violated** (reused cookie + misattributed second death lets a live re-acquirer be wiped by the first walk's stale entry) |

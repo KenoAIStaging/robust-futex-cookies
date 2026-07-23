@@ -113,6 +113,10 @@ step "QEMU guest tests" "$HERE/harness/runqemu.sh" -c "$(nproc)" -t 900
 # makes exhausted-counter states terminal by design, and the
 # violation-expected configs stop at their counterexample anyway).
 MODELS_QUICK="
+MCWRetainOK:pass:nodl
+MCWRetainNoRetain:violation:dl
+MCWRetainUnsync:violation:dl
+MCWRetainNoExitWake:violation:dl
 MCExplicitOK:pass:nodl
 MCExplicitNoWake:violation:nodl
 MCExplicitLostWaiter:violation:nodl
