@@ -19,8 +19,14 @@ FUTEX_ROBUST_UNLOCK.
 
 - TLA+: `tla/WaitersRetain.tla` (explicit kernel hash bucket queue,
   futex_wait modeled as snapshot + atomic revalidate-and-enqueue).
-  - MCWRetainOK: PASS exhaustive w/ liveness (32.9M generated / 9.2M
-    distinct, depth 60): TypeOK/QOK/Exclusion/WtrInv + WaiterServed.
+  - MCWRetainOK: PASS exhaustive w/ liveness (234.0M generated / 70.6M
+    distinct, depth 97, 1h35m): TypeOK/QOK/Exclusion/WtrInv +
+    WaiterServed. Action atomicity mirrors the kernel: hb-lock critical
+    sections (futex_wait_setup revalidate+enqueue, robust unlock
+    count+store+wake, each futex_wake) as single actions, userspace
+    32-bit atomics as single actions, and handle_futex_death split into
+    lockless get_user snapshot / cmpxchg with nval!=uval retry /
+    separate locked wake.
   - MCWRetainNoRetain (store 0, current mainline): WaiterServed violated -
     reproduces the woken-waiter-killed strand.
   - MCWRetainUnsync (count/store/wake unsynchronized): WaiterServed

@@ -8,17 +8,49 @@
 (* chain lives in the futex word instead of in the woken (killable)       *)
 (* waiter.                                                                 *)
 (*                                                                         *)
-(* Unlike ExplicitCookie.tla this model carries an explicit kernel hash   *)
-(* bucket queue and models futex_wait() as read-the-word (snapshot) plus  *)
-(* an atomic revalidate-and-enqueue - the atomicity provided by the hash  *)
-(* bucket lock. This is the granularity needed to validate that the      *)
-(* release store must be synchronized with waiter enqueueing.             *)
+(* Atomicity map - each action is exactly one of:                          *)
+(*                                                                         *)
+(*   (i) a single 32-bit atomic on the futex word in user space            *)
+(*       (TryAcquire, SetWtr, VdsoTry) - naturally one action;             *)
+(*                                                                         *)
+(*   (ii) one hb->lock critical section - sound to model as one atomic     *)
+(*       action because the queue is touched exclusively under hb->lock    *)
+(*       and the sections serialize against each other:                    *)
+(*         FutexWait   = futex_wait_setup(): futex_q_lock(),               *)
+(*                       futex_get_value_locked() revalidation against    *)
+(*                       the user supplied val, futex_queue()             *)
+(*                       (-EWOULDBLOCK path modeled as the EAGAIN         *)
+(*                       branch);                                          *)
+(*         RelSyscall  = futex_robust_unlock_wake(): count queued          *)
+(*                       waiters, release store, collect wakeups, all     *)
+(*                       inside one spin_lock(&hb->lock) section (the     *)
+(*                       pagefault retry re-runs the whole section        *)
+(*                       without observable intermediate state, so it     *)
+(*                       needs no extra step);                             *)
+(*         WalkEntryWake / WalkPendingWake / RelWake                       *)
+(*                     = futex_wake(..., 1): one locked wake walk;         *)
+(*                                                                         *)
+(*   (iii) a lockless kernel access in handle_futex_death(), modeled as    *)
+(*       its own step so its raciness against (i) and (ii) is explored:    *)
+(*         WalkEntryRead/WalkPendingRead = the get_user() snapshot;        *)
+(*         WalkEntryChk/WalkPendingChk   = branch decisions on that        *)
+(*                       snapshot; the OWNER_DIED store is the cmpxchg     *)
+(*                       whose success requires the word to still equal    *)
+(*                       the snapshot, with failure looping back to the    *)
+(*                       re-read (the kernel's nval != uval retry).        *)
+(*       The wake that follows a successful cmpxchg (or the owner-zero     *)
+(*       pending branch) is a separate futex_wake() call and therefore a   *)
+(*       separate action.                                                  *)
+(*                                                                         *)
+(* Userspace snapshots (expw) model the value argument userspace passes    *)
+(* to futex_wait() being read before the syscall.                          *)
 (*                                                                         *)
 (* Threads loop forever: idle -> lock -> hold -> unlock -> idle, may die  *)
 (* at any point outside idle, are cleaned up by the kernel exit walk       *)
-(* (mainline handle_futex_death(): entry then pending, owner match sets    *)
-(* OWNER_DIED preserving WAITERS, pending op on an ownerless word wakes    *)
-(* one waiter; NO foreign-owner replay), and reincarnate afterwards.       *)
+(* (mainline exit_robust_list(): list entries then the pending op;         *)
+(* handle_futex_death() owner match sets OWNER_DIED preserving WAITERS     *)
+(* and wakes one waiter; a pending op on an ownerless word wakes one       *)
+(* waiter; NO foreign-owner replay), and reincarnate afterwards.           *)
 (*                                                                         *)
 (* Switches:                                                               *)
 (*                                                                         *)
@@ -34,8 +66,8 @@
 (*     patched kernel does). FALSE splits count / store / wake into       *)
 (*     separate steps, modeling a release store not serialized with       *)
 (*     futex_wait() enqueueing (e.g. the store performed before taking    *)
-(*     the hash bucket lock, as the current futex_robust_unlock() does).  *)
-(*     TLC then finds a waiter which enqueues - legitimately, its         *)
+(*     the hash bucket lock, as the pre-patch futex_robust_unlock()       *)
+(*     does). TLC then finds a waiter which enqueues - legitimately, its  *)
 (*     revalidation still matches - between the count and the store, is   *)
 (*     not accounted for, and is stranded the same way.                   *)
 (*                                                                         *)
@@ -66,14 +98,17 @@ VARIABLES
     waited,     \* the thread slept at least once in this lock attempt
     expw,       \* futex_wait() expected value (userspace word snapshot)
     srem,       \* SyncStore=FALSE only: unlock's counted "waiters remain"
-    done_e,     \* kernel exit walk: robust list entry processed
-    done_p      \* kernel exit walk: pending op processed
+    wpc,        \* kernel exit walk program counter (per thread)
+    wsnap       \* exit walk get_user() snapshot of the futex word
 
 vars == <<word, q, pc, alive, pending, enq, assume_w, waited, expw, srem,
-          done_e, done_p>>
+          wpc, wsnap>>
 
 PCs == {"idle", "acq", "waitpre", "sleeping", "acquired", "enqueued", "own",
         "rel", "relslow", "relscan", "relstore", "relwake", "unlocked"}
+
+WPCs == {"run", "e_read", "e_chk", "e_wake", "p_read", "p_chk", "p_wake",
+         "done"}
 
 Word == [own : Threads \cup {0}, od : BOOLEAN, wtr : BOOLEAN]
 
@@ -92,8 +127,8 @@ TypeOK ==
     /\ waited \in [Threads -> BOOLEAN]
     /\ expw \in [Threads -> Word]
     /\ srem \in [Threads -> BOOLEAN]
-    /\ done_e \in [Threads -> BOOLEAN]
-    /\ done_p \in [Threads -> BOOLEAN]
+    /\ wpc \in [Threads -> WPCs]
+    /\ wsnap \in [Threads -> Word]
 
 Init ==
     /\ word = ZeroWord
@@ -106,8 +141,8 @@ Init ==
     /\ waited = [t \in Threads |-> FALSE]
     /\ expw = [t \in Threads |-> ZeroWord]
     /\ srem = [t \in Threads |-> FALSE]
-    /\ done_e = [t \in Threads |-> FALSE]
-    /\ done_p = [t \in Threads |-> FALSE]
+    /\ wpc = [t \in Threads |-> "run"]
+    /\ wsnap = [t \in Threads |-> ZeroWord]
 
 (***************************************************************************)
 (* Lock operation                                                          *)
@@ -120,12 +155,13 @@ StartAcq(t) ==
     /\ assume_w' = [assume_w EXCEPT ![t] = FALSE]
     /\ waited' = [waited EXCEPT ![t] = FALSE]
     /\ pc' = [pc EXCEPT ![t] = "acq"]
-    /\ UNCHANGED <<word, q, alive, enq, expw, srem, done_e, done_p>>
+    /\ UNCHANGED <<word, q, alive, enq, expw, srem, wpc, wsnap>>
 
-\* The acquisition cmpxchg: take a word whose owner part is 0 - free,
-\* free-but-contended (own 0, WAITERS set: the retained state) or dead
-\* owner (OWNER_DIED). WAITERS is preserved; assume_other_futex_waiters
-\* re-asserts it after this thread (may have) shared the bit.
+\* The acquisition cmpxchg (userspace, atomicity class (i)): take a word
+\* whose owner part is 0 - free, free-but-contended (own 0, WAITERS set:
+\* the retained state) or dead owner (OWNER_DIED). WAITERS is preserved;
+\* assume_other_futex_waiters re-asserts it after this thread (may have)
+\* shared the bit.
 TryAcquire(t) ==
     /\ alive[t] /\ pc[t] = "acq"
     /\ word.own = 0
@@ -133,7 +169,7 @@ TryAcquire(t) ==
                 wtr |-> word.wtr \/ assume_w[t]]
     /\ pc' = [pc EXCEPT ![t] = "acquired"]
     /\ UNCHANGED <<q, alive, pending, enq, assume_w, waited, expw, srem,
-                   done_e, done_p>>
+                   wpc, wsnap>>
 
 \* Contended trylock style give-up. A thread which already slept never
 \* gives up: it would discard the wakeup it consumed.
@@ -143,10 +179,10 @@ FailAcq(t) ==
     /\ pending' = [pending EXCEPT ![t] = FALSE]
     /\ pc' = [pc EXCEPT ![t] = "idle"]
     /\ UNCHANGED <<word, q, alive, enq, assume_w, waited, expw, srem,
-                   done_e, done_p>>
+                   wpc, wsnap>>
 
-\* Contended: set the WAITERS bit (cmpxchg on the current word) and
-\* snapshot the resulting value for futex_wait().
+\* Contended: set the WAITERS bit (userspace cmpxchg, class (i)) and
+\* snapshot the resulting value as the futex_wait() val argument.
 SetWtr(t) ==
     /\ alive[t] /\ pc[t] = "acq"
     /\ word.own # 0 /\ ~word.wtr
@@ -154,7 +190,7 @@ SetWtr(t) ==
     /\ expw' = [expw EXCEPT ![t] = [word EXCEPT !.wtr = TRUE]]
     /\ assume_w' = [assume_w EXCEPT ![t] = TRUE]
     /\ pc' = [pc EXCEPT ![t] = "waitpre"]
-    /\ UNCHANGED <<q, alive, pending, enq, waited, srem, done_e, done_p>>
+    /\ UNCHANGED <<q, alive, pending, enq, waited, srem, wpc, wsnap>>
 
 \* Contended, WAITERS already set: snapshot the word for futex_wait().
 SnapWait(t) ==
@@ -163,12 +199,13 @@ SnapWait(t) ==
     /\ expw' = [expw EXCEPT ![t] = word]
     /\ assume_w' = [assume_w EXCEPT ![t] = TRUE]
     /\ pc' = [pc EXCEPT ![t] = "waitpre"]
-    /\ UNCHANGED <<word, q, alive, pending, enq, waited, srem, done_e,
-                   done_p>>
+    /\ UNCHANGED <<word, q, alive, pending, enq, waited, srem, wpc, wsnap>>
 
-\* futex_wait(): under the hash bucket lock, revalidate the word against
-\* the snapshot and enqueue - or fail with EAGAIN and retry. This
-\* atomicity is the synchronization the release store relies on.
+\* futex_wait() = futex_wait_setup(), atomicity class (ii): one hb->lock
+\* section which revalidates the word against the val argument via
+\* futex_get_value_locked() and either enqueues (futex_queue()) or
+\* returns -EWOULDBLOCK. This under-lock revalidation is the
+\* synchronization the release store relies on.
 FutexWait(t) ==
     /\ alive[t] /\ pc[t] = "waitpre"
     /\ IF word = expw[t]
@@ -178,8 +215,8 @@ FutexWait(t) ==
        ELSE /\ q' = q
             /\ waited' = waited
             /\ pc' = [pc EXCEPT ![t] = "acq"]
-    /\ UNCHANGED <<word, alive, pending, enq, assume_w, expw, srem, done_e,
-                   done_p>>
+    /\ UNCHANGED <<word, alive, pending, enq, assume_w, expw, srem, wpc,
+                   wsnap>>
 
 \* Queue the entry in the robust list, then disarm the pending op.
 Enqueue(t) ==
@@ -187,14 +224,14 @@ Enqueue(t) ==
     /\ enq' = [enq EXCEPT ![t] = TRUE]
     /\ pc' = [pc EXCEPT ![t] = "enqueued"]
     /\ UNCHANGED <<word, q, alive, pending, assume_w, waited, expw, srem,
-                   done_e, done_p>>
+                   wpc, wsnap>>
 
 DisarmAcq(t) ==
     /\ alive[t] /\ pc[t] = "enqueued"
     /\ pending' = [pending EXCEPT ![t] = FALSE]
     /\ pc' = [pc EXCEPT ![t] = "own"]
     /\ UNCHANGED <<word, q, alive, enq, assume_w, waited, expw, srem,
-                   done_e, done_p>>
+                   wpc, wsnap>>
 
 (***************************************************************************)
 (* Unlock operation                                                        *)
@@ -206,11 +243,12 @@ StartRel(t) ==
     /\ pending' = [pending EXCEPT ![t] = TRUE]
     /\ enq' = [enq EXCEPT ![t] = FALSE]
     /\ pc' = [pc EXCEPT ![t] = "rel"]
-    /\ UNCHANGED <<word, q, alive, assume_w, waited, expw, srem, done_e,
-                   done_p>>
+    /\ UNCHANGED <<word, q, alive, assume_w, waited, expw, srem, wpc,
+                   wsnap>>
 
-\* The vDSO try_unlock: cmpxchg expecting exactly the own TID - no
-\* WAITERS, no OWNER_DIED. On failure fall back to the syscall.
+\* The vDSO try_unlock (userspace cmpxchg, class (i)): expects exactly
+\* the own TID - no WAITERS, no OWNER_DIED. On failure fall back to the
+\* syscall.
 VdsoTry(t) ==
     /\ alive[t] /\ pc[t] = "rel"
     /\ IF word = [own |-> t, od |-> FALSE, wtr |-> FALSE]
@@ -220,11 +258,14 @@ VdsoTry(t) ==
             /\ pc' = [pc EXCEPT
                         ![t] = IF SyncStore THEN "relslow" ELSE "relscan"]
     /\ UNCHANGED <<q, alive, pending, enq, assume_w, waited, expw, srem,
-                   done_e, done_p>>
+                   wpc, wsnap>>
 
-\* The kernel robust unlock, synchronized variant: wake one waiter,
-\* count the remaining ones and perform the release store in a single
-\* hash bucket lock critical section.
+\* The kernel robust unlock, synchronized variant (class (ii)): wake one
+\* waiter, count the remaining ones and perform the release store in a
+\* single hash bucket lock critical section, as
+\* futex_robust_unlock_wake() does. The pagefault retry in the
+\* implementation re-runs the whole section (nothing modified before the
+\* store succeeds), so it needs no separate step.
 RelSyscall(t) ==
     /\ SyncStore
     /\ alive[t] /\ pc[t] = "relslow"
@@ -237,7 +278,7 @@ RelSyscall(t) ==
                         wtr |-> RetainWaiters /\ Tail(q) # <<>>]
             /\ pc' = [pc EXCEPT ![t] = "unlocked", ![Head(q)] = "acq"]
     /\ UNCHANGED <<alive, pending, enq, assume_w, waited, expw, srem,
-                   done_e, done_p>>
+                   wpc, wsnap>>
 
 \* The kernel robust unlock, unsynchronized variant: the remaining
 \* waiter count, the release store and the wake are separate steps, so
@@ -249,7 +290,7 @@ RelScan(t) ==
     /\ srem' = [srem EXCEPT ![t] = Len(q) > 1]
     /\ pc' = [pc EXCEPT ![t] = "relstore"]
     /\ UNCHANGED <<word, q, alive, pending, enq, assume_w, waited, expw,
-                   done_e, done_p>>
+                   wpc, wsnap>>
 
 RelStore(t) ==
     /\ ~SyncStore
@@ -257,7 +298,7 @@ RelStore(t) ==
     /\ word' = [own |-> 0, od |-> FALSE, wtr |-> RetainWaiters /\ srem[t]]
     /\ pc' = [pc EXCEPT ![t] = "relwake"]
     /\ UNCHANGED <<q, alive, pending, enq, assume_w, waited, expw, srem,
-                   done_e, done_p>>
+                   wpc, wsnap>>
 
 RelWake(t) ==
     /\ ~SyncStore
@@ -268,7 +309,7 @@ RelWake(t) ==
        ELSE /\ q' = Tail(q)
             /\ pc' = [pc EXCEPT ![t] = "unlocked", ![Head(q)] = "acq"]
     /\ UNCHANGED <<word, alive, pending, enq, assume_w, waited, expw, srem,
-                   done_e, done_p>>
+                   wpc, wsnap>>
 
 \* Disarm the pending op after the release store.
 FinishRel(t) ==
@@ -276,10 +317,17 @@ FinishRel(t) ==
     /\ pending' = [pending EXCEPT ![t] = FALSE]
     /\ pc' = [pc EXCEPT ![t] = "idle"]
     /\ UNCHANGED <<word, q, alive, enq, assume_w, waited, expw, srem,
-                   done_e, done_p>>
+                   wpc, wsnap>>
 
 (***************************************************************************)
 (* Death and kernel exit walk                                              *)
+(*                                                                         *)
+(* exit_robust_list() processes the queued list entries first, then the   *)
+(* pending op. handle_futex_death() itself is lockless: get_user()        *)
+(* snapshot, branch decisions on the snapshot, an OWNER_DIED cmpxchg      *)
+(* which retries from the re-read when the word changed underneath        *)
+(* (nval != uval), and a subsequent futex_wake() which is its own hash    *)
+(* bucket lock section. Each of these is a separate action here.          *)
 (***************************************************************************)
 
 \* Death at any point outside idle. A sleeping task is removed from the
@@ -293,54 +341,106 @@ Die(t) ==
     /\ pc[t] \notin {"idle", "relscan", "relstore", "relwake"}
     /\ alive' = [alive EXCEPT ![t] = FALSE]
     /\ q' = SelectSeq(q, LAMBDA e : e # t)
+    /\ wpc' = [wpc EXCEPT ![t] = "e_read"]
     /\ UNCHANGED <<word, pc, pending, enq, assume_w, waited, expw, srem,
-                   done_e, done_p>>
+                   wsnap>>
 
-\* Process the robust list entry (handle_futex_death(), pending_op ==
-\* false). The list walk skips an entry which equals list_op_pending.
-CleanupEntry(t) ==
-    /\ ~alive[t] /\ ~done_e[t]
-    /\ done_e' = [done_e EXCEPT ![t] = TRUE]
-    /\ IF enq[t] /\ ~pending[t] /\ word.own = t
-       THEN /\ word' = [own |-> 0, od |-> TRUE, wtr |-> word.wtr]
-            /\ IF word.wtr /\ q # <<>>
-               THEN /\ q' = Tail(q)
-                    /\ pc' = [pc EXCEPT ![Head(q)] = "acq"]
-               ELSE /\ q' = q
-                    /\ pc' = pc
-       ELSE UNCHANGED <<word, q, pc>>
-    /\ UNCHANGED <<alive, pending, enq, assume_w, waited, expw, srem,
-                   done_p>>
+\* List entry step, get_user() snapshot. The walk skips an entry which
+\* equals list_op_pending and a thread whose robust list is empty.
+WalkEntryRead(t) ==
+    /\ ~alive[t] /\ wpc[t] = "e_read"
+    /\ IF enq[t] /\ ~pending[t]
+       THEN /\ wsnap' = [wsnap EXCEPT ![t] = word]
+            /\ wpc' = [wpc EXCEPT ![t] = "e_chk"]
+       ELSE /\ wsnap' = wsnap
+            /\ wpc' = [wpc EXCEPT ![t] = "p_read"]
+    /\ UNCHANGED <<word, q, pc, alive, pending, enq, assume_w, waited,
+                   expw, srem>>
 
-\* Process the pending op (handle_futex_death(), pending_op == true),
-\* after the list entries as in mainline exit_robust_list(). An
-\* ownerless word (owner part 0 - released, WAITERS and OWNER_DIED
-\* irrelevant) gets the wakeup replayed; an owner match sets OWNER_DIED
-\* preserving WAITERS and wakes; a foreign owner is left alone.
-CleanupPending(t) ==
-    /\ ~alive[t] /\ done_e[t] /\ ~done_p[t]
-    /\ done_p' = [done_p EXCEPT ![t] = TRUE]
-    /\ IF pending[t] /\ word.own = 0
-       THEN /\ IF ExitWakeOwnerZero /\ q # <<>>
-               THEN /\ q' = Tail(q)
-                    /\ pc' = [pc EXCEPT ![Head(q)] = "acq"]
-               ELSE /\ q' = q
-                    /\ pc' = pc
-            /\ word' = word
-       ELSE IF pending[t] /\ word.own = t
-       THEN /\ word' = [own |-> 0, od |-> TRUE, wtr |-> word.wtr]
-            /\ IF word.wtr /\ q # <<>>
-               THEN /\ q' = Tail(q)
-                    /\ pc' = [pc EXCEPT ![Head(q)] = "acq"]
-               ELSE /\ q' = q
-                    /\ pc' = pc
-       ELSE UNCHANGED <<word, q, pc>>
-    /\ UNCHANGED <<alive, pending, enq, assume_w, waited, expw, srem,
-                   done_e>>
+\* List entry step, branch + OWNER_DIED cmpxchg (pending_op == false:
+\* no owner-zero wake). A snapshot owner mismatch is a one-shot
+\* decision; the cmpxchg retries through the re-read when the word
+\* changed. The wake decision uses the snapshot's WAITERS bit, as the
+\* kernel keys the wake on uval.
+WalkEntryChk(t) ==
+    /\ ~alive[t] /\ wpc[t] = "e_chk"
+    /\ IF wsnap[t].own # t
+       THEN /\ word' = word
+            /\ wpc' = [wpc EXCEPT ![t] = "p_read"]
+       ELSE IF word = wsnap[t]
+       THEN /\ word' = [own |-> 0, od |-> TRUE, wtr |-> wsnap[t].wtr]
+            /\ wpc' = [wpc EXCEPT
+                         ![t] = IF wsnap[t].wtr THEN "e_wake" ELSE "p_read"]
+       ELSE /\ word' = word
+            /\ wpc' = [wpc EXCEPT ![t] = "e_read"]
+    /\ wsnap' = [wsnap EXCEPT ![t] = ZeroWord]
+    /\ UNCHANGED <<q, pc, alive, pending, enq, assume_w, waited, expw,
+                   srem>>
+
+\* The futex_wake(1) after a successful OWNER_DIED store (class (ii)).
+WalkEntryWake(t) ==
+    /\ ~alive[t] /\ wpc[t] = "e_wake"
+    /\ IF q = <<>>
+       THEN /\ q' = q
+            /\ pc' = pc
+       ELSE /\ q' = Tail(q)
+            /\ pc' = [pc EXCEPT ![Head(q)] = "acq"]
+    /\ wpc' = [wpc EXCEPT ![t] = "p_read"]
+    /\ UNCHANGED <<word, alive, pending, enq, assume_w, waited, expw, srem,
+                   wsnap>>
+
+\* Pending op step, get_user() snapshot.
+WalkPendingRead(t) ==
+    /\ ~alive[t] /\ wpc[t] = "p_read"
+    /\ IF pending[t]
+       THEN /\ wsnap' = [wsnap EXCEPT ![t] = word]
+            /\ wpc' = [wpc EXCEPT ![t] = "p_chk"]
+       ELSE /\ wsnap' = wsnap
+            /\ wpc' = [wpc EXCEPT ![t] = "done"]
+    /\ UNCHANGED <<word, q, pc, alive, pending, enq, assume_w, waited,
+                   expw, srem>>
+
+\* Pending op step, branch + cmpxchg (pending_op == true): an ownerless
+\* snapshot (owner part 0 - released, WAITERS and OWNER_DIED
+\* irrelevant) gets the wakeup replayed without touching the word; an
+\* owner match sets OWNER_DIED preserving WAITERS and wakes; a foreign
+\* owner is left alone (one-shot, no replay).
+WalkPendingChk(t) ==
+    /\ ~alive[t] /\ wpc[t] = "p_chk"
+    /\ IF wsnap[t].own = 0
+       THEN /\ word' = word
+            /\ wpc' = [wpc EXCEPT
+                         ![t] = IF ExitWakeOwnerZero THEN "p_wake"
+                                ELSE "done"]
+       ELSE IF wsnap[t].own = t
+       THEN IF word = wsnap[t]
+            THEN /\ word' = [own |-> 0, od |-> TRUE, wtr |-> wsnap[t].wtr]
+                 /\ wpc' = [wpc EXCEPT
+                              ![t] = IF wsnap[t].wtr THEN "p_wake"
+                                     ELSE "done"]
+            ELSE /\ word' = word
+                 /\ wpc' = [wpc EXCEPT ![t] = "p_read"]
+       ELSE /\ word' = word
+            /\ wpc' = [wpc EXCEPT ![t] = "done"]
+    /\ wsnap' = [wsnap EXCEPT ![t] = ZeroWord]
+    /\ UNCHANGED <<q, pc, alive, pending, enq, assume_w, waited, expw,
+                   srem>>
+
+\* The futex_wake(1) of the pending op handling (class (ii)).
+WalkPendingWake(t) ==
+    /\ ~alive[t] /\ wpc[t] = "p_wake"
+    /\ IF q = <<>>
+       THEN /\ q' = q
+            /\ pc' = pc
+       ELSE /\ q' = Tail(q)
+            /\ pc' = [pc EXCEPT ![Head(q)] = "acq"]
+    /\ wpc' = [wpc EXCEPT ![t] = "done"]
+    /\ UNCHANGED <<word, alive, pending, enq, assume_w, waited, expw, srem,
+                   wsnap>>
 
 \* Recycle the thread as a fresh incarnation once the walk finished.
 Reincarnate(t) ==
-    /\ ~alive[t] /\ done_e[t] /\ done_p[t]
+    /\ ~alive[t] /\ wpc[t] = "done"
     /\ alive' = [alive EXCEPT ![t] = TRUE]
     /\ pc' = [pc EXCEPT ![t] = "idle"]
     /\ pending' = [pending EXCEPT ![t] = FALSE]
@@ -349,11 +449,13 @@ Reincarnate(t) ==
     /\ waited' = [waited EXCEPT ![t] = FALSE]
     /\ expw' = [expw EXCEPT ![t] = ZeroWord]
     /\ srem' = [srem EXCEPT ![t] = FALSE]
-    /\ done_e' = [done_e EXCEPT ![t] = FALSE]
-    /\ done_p' = [done_p EXCEPT ![t] = FALSE]
+    /\ wpc' = [wpc EXCEPT ![t] = "run"]
+    /\ wsnap' = [wsnap EXCEPT ![t] = ZeroWord]
     /\ UNCHANGED <<word, q>>
 
-Cleanup(t) == CleanupEntry(t) \/ CleanupPending(t)
+Cleanup(t) ==
+    \/ WalkEntryRead(t) \/ WalkEntryChk(t) \/ WalkEntryWake(t)
+    \/ WalkPendingRead(t) \/ WalkPendingChk(t) \/ WalkPendingWake(t)
 
 Next ==
     \E t \in Threads :
