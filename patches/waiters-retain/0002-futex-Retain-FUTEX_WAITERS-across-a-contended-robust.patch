@@ -1,4 +1,4 @@
-From b178df8704a784b0a59b6c5f2f91b237cd4e12d1 Mon Sep 17 00:00:00 2001
+From 38e2e9ce14888d4d442ff1c792b106559735f793 Mon Sep 17 00:00:00 2001
 From: Keno Fischer <keno@juliahub.com>
 To: Thomas Gleixner <tglx@kernel.org>,
     Ingo Molnar <mingo@redhat.com>,
@@ -92,8 +92,8 @@ Assisted-by: ClaudeCode:claude-fable-5 tla+
  Documentation/locking/robust-futex-ABI.rst |  17 +++-
  include/vdso/futex.h                       |   3 +-
  kernel/futex/futex.h                       |  12 +++
- kernel/futex/waitwake.c                    | 105 ++++++++++++++++-----
- 4 files changed, 110 insertions(+), 27 deletions(-)
+ kernel/futex/waitwake.c                    | 109 ++++++++++++++++-----
+ 4 files changed, 116 insertions(+), 25 deletions(-)
 
 diff --git a/Documentation/locking/robust-futex-ABI.rst b/Documentation/locking/robust-futex-ABI.rst
 index 5e6a0665b8ba..7e83b3d6f4f0 100644
@@ -161,7 +161,7 @@ index f00f0863ed44..367a8eaa650d 100644
  extern void __futex_queue(struct futex_q *q, struct futex_hash_bucket *hb,
  				struct task_struct *task);
 diff --git a/kernel/futex/waitwake.c b/kernel/futex/waitwake.c
-index 17ceb5ca186e..53cc18e0b833 100644
+index 17ceb5ca186e..cf665196cdb5 100644
 --- a/kernel/futex/waitwake.c
 +++ b/kernel/futex/waitwake.c
 @@ -178,26 +178,63 @@ static int futex_wake_locked(struct futex_hash_bucket *hb, union futex_key *key,
@@ -243,7 +243,7 @@ index 17ceb5ca186e..53cc18e0b833 100644
  }
  
  /*
-@@ -205,9 +242,11 @@ static bool futex_robust_unlock(u32 __user *uaddr, unsigned int flags, void __us
+@@ -205,6 +242,8 @@ static bool futex_robust_unlock(u32 __user *uaddr, unsigned int flags, void __us
   */
  int futex_wake(u32 __user *uaddr, unsigned int flags, void __user *pop, int nr_wake, u32 bitset)
  {
@@ -251,12 +251,8 @@ index 17ceb5ca186e..53cc18e0b833 100644
 +	bool wake = !((flags & FLAGS_STRICT) && !nr_wake);
  	union futex_key key = FUTEX_KEY_INIT;
  	DEFINE_WAKE_Q(wake_q);
--	int ret;
-+	int ret, err = 0;
- 
- 	if (!bitset)
- 		return -EINVAL;
-@@ -216,24 +255,42 @@ int futex_wake(u32 __user *uaddr, unsigned int flags, void __user *pop, int nr_w
+ 	int ret;
+@@ -216,22 +255,48 @@ int futex_wake(u32 __user *uaddr, unsigned int flags, void __user *pop, int nr_w
  	if (unlikely(ret != 0))
  		return ret;
  
@@ -287,8 +283,16 @@ index 17ceb5ca186e..53cc18e0b833 100644
 +	if (wake)
 +		ret = futex_wake_locked(hb, &key, &wake_q, nr_wake, bitset);
 +
-+	if (robust)
-+		err = futex_robust_release(hb, &key, uaddr);
++	if (robust && futex_robust_release(hb, &key, uaddr)) {
++		spin_unlock(&hb->lock);
++		/*
++		 * The futex word could not be released: the futex stays
++		 * locked and the still armed pending op lets the robust
++		 * list exit code recover it if the task dies.
++		 */
++		ret = -EFAULT;
++		goto out;
++	}
 +
  	spin_unlock(&hb->lock);
 +
@@ -298,15 +302,12 @@ index 17ceb5ca186e..53cc18e0b833 100644
 +	 * head is usually part of the TLS. The chance of survival is close
 +	 * to zero.
 +	 */
-+	if (robust && !err && !futex_robust_list_clear_pending(pop, flags))
-+		err = -EFAULT;
-+
++	if (robust && !futex_robust_list_clear_pending(pop, flags))
++		ret = -EFAULT;
++out:
  	wake_up_q(&wake_q);
--	return ret;
-+	return err ?: ret;
+ 	return ret;
  }
- 
- static int futex_atomic_op_inuser(unsigned int encoded_op, u32 __user *uaddr)
 -- 
 2.54.0
 
