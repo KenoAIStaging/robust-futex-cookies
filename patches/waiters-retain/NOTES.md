@@ -16,7 +16,12 @@ futex_wake() (no functional change), patch 2 reuses it and replaces the
 two-pass counting with a wake-first design whose fault path re-locks and
 redoes only the remaining-waiter scan + store; the store uses a new
 futex_put_value_locked() helper in futex.h (guard(pagefault) +
-scoped_user_write_access, sibling of futex_get_value_locked()). Note this does NOT fix the
+scoped_user_write_access, sibling of futex_get_value_locked()). v3
+(same day, per review): futex_wake() owns the single hash bucket lock
+section for the whole operation - walk via futex_wake_locked(), release
+via futex_robust_release() (called and returning with the lock held,
+dropping it internally only around fault-in), pending clear after the
+section; no separate robust entry path. Note this does NOT fix the
 legacy glibc store-0-then-FUTEX_WAKE protocol (the kernel never writes the
 word there); the story for legacy binaries is adoption of
 FUTEX_ROBUST_UNLOCK.

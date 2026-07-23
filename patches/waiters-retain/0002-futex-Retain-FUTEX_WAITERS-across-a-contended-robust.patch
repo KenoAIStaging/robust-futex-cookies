@@ -1,4 +1,4 @@
-From 3ea52fd65fbf6709e9537f53fb3d041bcd296072 Mon Sep 17 00:00:00 2001
+From b178df8704a784b0a59b6c5f2f91b237cd4e12d1 Mon Sep 17 00:00:00 2001
 From: Keno Fischer <keno@juliahub.com>
 To: Thomas Gleixner <tglx@kernel.org>,
     Ingo Molnar <mingo@redhat.com>,
@@ -7,7 +7,7 @@ Cc: Darren Hart <dvhart@infradead.org>,
     Davidlohr Bueso <dave@stgolabs.net>,
     =?UTF-8?q?Andr=C3=A9=20Almeida?= <andrealmeid@igalia.com>,
     linux-kernel@vger.kernel.org
-Date: Thu, 23 Jul 2026 17:18:54 +0000
+Date: Thu, 23 Jul 2026 17:37:49 +0000
 Subject: [PATCH 2/3] futex: Retain FUTEX_WAITERS across a contended robust
  unlock
 
@@ -61,14 +61,14 @@ the hash bucket lock; with such an unsynchronized store a waiter can
 block on the pre-release value after the remaining waiter check without
 being counted, and is stranded the same way.
 
-Therefore move the robust unlock into the hash bucket lock section:
-reuse the wake walk, then check for remaining queued waiters and perform
-the store while still holding the lock. Faults leave the lock section
-and redo the check after faulting in the page, so the store never acts
-on a stale queue. The unconditional pre-lock store and the hash bucket
-waiters fast path are dropped for the robust unlock: the uncontended
-case is handled by the vDSO helper, so a robust unlock syscall is
-contended by definition.
+Therefore move the release into futex_wake()'s hash bucket lock section:
+after the wakeup walk, futex_robust_release() checks for remaining
+queued waiters and stores the resulting value while still holding the
+lock. Faults drop the lock and the check is redone after reacquiring it,
+so the store never acts on a stale queue. The unconditional pre-lock
+store and the hash bucket waiters fast path are dropped for the robust
+unlock: the uncontended case is handled by the vDSO helper, so a robust
+unlock syscall is contended by definition.
 
 This changes the FUTEX_ROBUST_UNLOCK ABI contract, which has not been in
 a released kernel yet: user space must treat a futex word with a zero
@@ -89,11 +89,11 @@ Fixes: 3ca9595d9fb6 ("futex: Add support for unlocking robust futexes")
 Signed-off-by: Keno Fischer <keno@juliahub.com>
 Assisted-by: ClaudeCode:claude-fable-5 tla+
 ---
- Documentation/locking/robust-futex-ABI.rst | 17 ++++-
- include/vdso/futex.h                       |  3 +-
- kernel/futex/futex.h                       | 12 +++
- kernel/futex/waitwake.c                    | 87 ++++++++++++++++++----
- 4 files changed, 103 insertions(+), 16 deletions(-)
+ Documentation/locking/robust-futex-ABI.rst |  17 +++-
+ include/vdso/futex.h                       |   3 +-
+ kernel/futex/futex.h                       |  12 +++
+ kernel/futex/waitwake.c                    | 105 ++++++++++++++++-----
+ 4 files changed, 110 insertions(+), 27 deletions(-)
 
 diff --git a/Documentation/locking/robust-futex-ABI.rst b/Documentation/locking/robust-futex-ABI.rst
 index 5e6a0665b8ba..7e83b3d6f4f0 100644
@@ -161,16 +161,15 @@ index f00f0863ed44..367a8eaa650d 100644
  extern void __futex_queue(struct futex_q *q, struct futex_hash_bucket *hb,
  				struct task_struct *task);
 diff --git a/kernel/futex/waitwake.c b/kernel/futex/waitwake.c
-index 17ceb5ca186e..b8613fe06233 100644
+index 17ceb5ca186e..53cc18e0b833 100644
 --- a/kernel/futex/waitwake.c
 +++ b/kernel/futex/waitwake.c
-@@ -178,26 +178,87 @@ static int futex_wake_locked(struct futex_hash_bucket *hb, union futex_key *key,
+@@ -178,26 +178,63 @@ static int futex_wake_locked(struct futex_hash_bucket *hb, union futex_key *key,
  }
  
  /*
 - * If requested, clear the robust list pending op and unlock the futex
-+ * FUTEX_ROBUST_UNLOCK: release the futex word, clear the robust list
-+ * pending op and wake up to @nr_wake waiters.
++ * Release the futex word of a robust futex (FUTEX_ROBUST_UNLOCK).
 + *
 + * The futex word is released to FUTEX_WAITERS instead of 0 when waiters
 + * remain queued after the wakeup. A woken waiter can be killed before it
@@ -190,41 +189,38 @@ index 17ceb5ca186e..b8613fe06233 100644
 + * against futex_wait() enqueueing further waiters: a waiter either
 + * revalidates the futex word after the store and goes back to user space
 + * with -EAGAIN, or is enqueued before the remaining waiter check and
-+ * thereby represented in the stored value. On a fault the section is left
-+ * to fault in the page and the check is redone, so the store never acts on
-+ * a stale queue.
++ * thereby represented in the stored value.
 + *
-+ * There is no uncontended fast path: user space only takes the syscall
-+ * when the vDSO try_unlock helper failed on a contended futex word.
++ * Must be called with @hb->lock held after the wakeup walk and returns
++ * with it held. The lock is dropped to fault in the futex word and the
++ * remaining waiter check is redone after reacquiring it, so the store
++ * never acts on a stale queue.
   */
 -static bool futex_robust_unlock(u32 __user *uaddr, unsigned int flags, void __user *pop)
-+static int futex_robust_unlock(u32 __user *uaddr, unsigned int flags, void __user *pop,
-+			       int nr_wake, u32 bitset, union futex_key *key)
++static int futex_robust_release(struct futex_hash_bucket *hb, union futex_key *key,
++				u32 __user *uaddr)
  {
 -	if (!(flags & FLAGS_ROBUST_UNLOCK))
 -		return true;
-+	DEFINE_WAKE_Q(wake_q);
 +	struct futex_q *this;
-+	int ret = 0;
++	int ret;
  
 -	/* First unlock the futex, which requires release semantics. */
 -	scoped_user_write_access(uaddr, efault)
 -		unsafe_atomic_store_release_user(0, uaddr, efault);
-+	CLASS(hbr, hbr)(key);
-+	auto hb = hbr.hb;
-+
-+	spin_lock(&hb->lock);
-+
-+	if (!((flags & FLAGS_STRICT) && !nr_wake))
-+		ret = futex_wake_locked(hb, key, &wake_q, nr_wake, bitset);
-+
 +	for (;;) {
 +		u32 mval = 0;
-+
+ 
+-	/*
+-	 * Clear the pending list op now. If that fails, then the task is in
+-	 * deeper trouble as the robust list head is usually part of the TLS.
+-	 * The chance of survival is close to zero.
+-	 */
+-	return futex_robust_list_clear_pending(pop, flags);
 +		/*
 +		 * Waiters which remain queued must stay represented in the
-+		 * futex word, whether the wakeup above skipped them due to
-+		 * @nr_wake, @bitset or a PI mismatch.
++		 * futex word, whether the wakeup walk skipped them due to
++		 * the wake count, the bitset or a PI mismatch.
 +		 */
 +		plist_for_each_entry(this, &hb->chain, list) {
 +			if (futex_match(&this->key, key)) {
@@ -234,46 +230,83 @@ index 17ceb5ca186e..b8613fe06233 100644
 +		}
 +
 +		if (!futex_put_value_locked(mval, uaddr))
-+			break;
-+
-+		spin_unlock(&hb->lock);
-+		if (fault_in_user_writeable(uaddr)) {
-+			ret = -EFAULT;
-+			goto out;
-+		}
-+		spin_lock(&hb->lock);
-+	}
-+
-+	spin_unlock(&hb->lock);
++			return 0;
  
- 	/*
- 	 * Clear the pending list op now. If that fails, then the task is in
- 	 * deeper trouble as the robust list head is usually part of the TLS.
- 	 * The chance of survival is close to zero.
- 	 */
--	return futex_robust_list_clear_pending(pop, flags);
--
 -efault:
 -	return false;
-+	if (!futex_robust_list_clear_pending(pop, flags))
-+		ret = -EFAULT;
-+out:
-+	wake_up_q(&wake_q);
-+	return ret;
++		spin_unlock(&hb->lock);
++		ret = fault_in_user_writeable(uaddr) ? -EFAULT : 0;
++		spin_lock(&hb->lock);
++		if (ret)
++			return ret;
++	}
  }
  
  /*
-@@ -216,8 +277,8 @@ int futex_wake(u32 __user *uaddr, unsigned int flags, void __user *pop, int nr_w
+@@ -205,9 +242,11 @@ static bool futex_robust_unlock(u32 __user *uaddr, unsigned int flags, void __us
+  */
+ int futex_wake(u32 __user *uaddr, unsigned int flags, void __user *pop, int nr_wake, u32 bitset)
+ {
++	bool robust = flags & FLAGS_ROBUST_UNLOCK;
++	bool wake = !((flags & FLAGS_STRICT) && !nr_wake);
+ 	union futex_key key = FUTEX_KEY_INIT;
+ 	DEFINE_WAKE_Q(wake_q);
+-	int ret;
++	int ret, err = 0;
+ 
+ 	if (!bitset)
+ 		return -EINVAL;
+@@ -216,24 +255,42 @@ int futex_wake(u32 __user *uaddr, unsigned int flags, void __user *pop, int nr_w
  	if (unlikely(ret != 0))
  		return ret;
  
 -	if (!futex_robust_unlock(uaddr, flags, pop))
 -		return -EFAULT;
-+	if (flags & FLAGS_ROBUST_UNLOCK)
-+		return futex_robust_unlock(uaddr, flags, pop, nr_wake, bitset, &key);
- 
- 	if ((flags & FLAGS_STRICT) && !nr_wake)
+-
+-	if ((flags & FLAGS_STRICT) && !nr_wake)
++	if (!robust && !wake)
  		return 0;
+ 
+ 	CLASS(hbr, hbr)(&key);
+ 	auto hb = hbr.hb;
+ 
+-	/* Make sure we really have tasks to wakeup */
+-	if (!futex_hb_waiters_pending(hb))
++	/*
++	 * Make sure we really have tasks to wakeup. There is no such fast
++	 * path for a robust unlock: it releases the futex word regardless,
++	 * and user space only takes the syscall when the vDSO try_unlock
++	 * helper failed on a contended futex word.
++	 */
++	if (!robust && !futex_hb_waiters_pending(hb))
+ 		return ret;
+ 
+ 	spin_lock(&hb->lock);
+-	ret = futex_wake_locked(hb, &key, &wake_q, nr_wake, bitset);
++
++	if (wake)
++		ret = futex_wake_locked(hb, &key, &wake_q, nr_wake, bitset);
++
++	if (robust)
++		err = futex_robust_release(hb, &key, uaddr);
++
+ 	spin_unlock(&hb->lock);
++
++	/*
++	 * With the futex word released, clear the pending list op now. If
++	 * that fails, then the task is in deeper trouble as the robust list
++	 * head is usually part of the TLS. The chance of survival is close
++	 * to zero.
++	 */
++	if (robust && !err && !futex_robust_list_clear_pending(pop, flags))
++		err = -EFAULT;
++
+ 	wake_up_q(&wake_q);
+-	return ret;
++	return err ?: ret;
+ }
+ 
+ static int futex_atomic_op_inuser(unsigned int encoded_op, u32 __user *uaddr)
 -- 
 2.54.0
 
